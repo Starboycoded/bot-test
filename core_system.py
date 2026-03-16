@@ -75,6 +75,12 @@ CATALOG_URL       = os.environ.get("CATALOG_URL", "https://techsquad-bot-2-0.onr
 AI_ENGINE  = os.environ.get("AI_ENGINE", "groq").lower()
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
+# FIX: Strip @c.us suffix that Green API adds to phone numbers
+def clean_phone(phone: str) -> str:
+    """Green API sends phones as 2349012345678@c.us — strip the suffix."""
+    return str(phone).replace("@c.us", "").replace("@g.us", "").strip()
+
+
 green_api = API.GreenApi(
     GREEN_ID, GREEN_TOKEN,
     "https://7103.api.greenapi.com",
@@ -178,8 +184,9 @@ def save_profile(sc, phone: str, name: str, address: str):
     try:
         ws   = sc.open("TechSquad").worksheet("Customers")
         rows = ws.get_all_records()
+        phone = clean_phone(phone)
         idx  = next(
-            (i + 2 for i, r in enumerate(rows) if str(r.get("Phone", "")) == str(phone)),
+            (i + 2 for i, r in enumerate(rows) if clean_phone(str(r.get("Phone", ""))) == phone),
             None
         )
         row = [phone, name, address, time.strftime("%Y-%m-%d")]
@@ -206,7 +213,8 @@ def log_order(sc, order_id, phone, name, items_text, address):
 def get_order_history(sc, phone: str):
     try:
         rows = sc.open("TechSquad").worksheet("Sales").get_all_records()
-        return [r for r in rows if str(r.get("Phone", "")) == str(phone)]
+        phone = clean_phone(phone)
+        return [r for r in rows if clean_phone(str(r.get("Phone", ""))) == phone]
     except Exception as e:
         print(f"[Sheets] Order history failed: {e}")
         return []
@@ -219,8 +227,9 @@ def save_session_state(sc, phone: str, session: dict):
     try:
         ws   = sc.open("TechSquad").worksheet("Sessions")
         rows = ws.get_all_records()
+        phone = clean_phone(phone)
         idx  = next(
-            (i + 2 for i, r in enumerate(rows) if str(r.get("Phone", "")) == str(phone)),
+            (i + 2 for i, r in enumerate(rows) if clean_phone(str(r.get("Phone", ""))) == phone),
             None
         )
         cart_json = json.dumps(session.get("cart", {}))
@@ -244,7 +253,8 @@ def load_session_state(sc, phone: str) -> dict | None:
     """Load saved checkout state from Sheets after a restart."""
     try:
         rows = sc.open("TechSquad").worksheet("Sessions").get_all_records()
-        row  = next((r for r in rows if str(r.get("Phone", "")) == str(phone)), None)
+        phone = clean_phone(phone)
+        row  = next((r for r in rows if clean_phone(str(r.get("Phone", ""))) == phone), None)
         if not row:
             return None
         # Only restore if it was updated in the last 30 mins
@@ -733,7 +743,7 @@ def webhook():
         return "OK", 200
     try:
         msg_data = data.get("messageData", {})
-        uid      = data.get("senderData", {}).get("sender")
+        uid      = clean_phone(data.get("senderData", {}).get("sender", ""))
         msg_type = msg_data.get("typeMessage")
 
         if not uid:
