@@ -776,7 +776,8 @@ def webhook():
 
 
 # ══════════════════════════════════════════════════════
-# 10. STOREFRONT
+# 10. STOREFRONT  — full shopping cart
+#     Add multiple items → one WhatsApp message sent
 # ══════════════════════════════════════════════════════
 @app.route("/shop/<vendor_name>")
 def shop(vendor_name):
@@ -805,11 +806,14 @@ def shop(vendor_name):
                 f'<div class="no-img">{name[:2].upper()}</div>'
             )
 
+            # Safe name for JS (escape quotes)
+            js_name = name.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
+
             if stock > 0:
-                wa_msg = quote(f"I'd like to order: {name}")
                 btn = (
-                    f'<a href="https://wa.me/{BOT_PHONE}?text={wa_msg}" '
-                    f'class="btn-order" target="_blank">🛒 Order via WhatsApp</a>'
+                    f'<button class="btn-add" '
+                    f"onclick=\"addToCart('{js_name}', {int(price)})\">"
+                    f"Add to Cart</button>"
                 )
             else:
                 btn = '<span class="btn-soldout">Sold Out</span>'
@@ -827,23 +831,25 @@ def shop(vendor_name):
   </div>
 </div>"""
 
-        return f"""<!DOCTYPE html>
+        page = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{vendor_title} — The Tech Squad</title>
+<title>{vendor_title}</title>
 <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
-:root{{--bg:#0a0a0a;--surface:#141414;--border:#252525;--green:#25D366;--green-glow:rgba(37,211,102,.12);--text:#f2f2f2;--muted:#666}}
-body{{font-family:'Sora',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}}
-header{{background:var(--surface);border-bottom:1px solid var(--border);padding:18px 20px;text-align:center;position:sticky;top:0;z-index:100;backdrop-filter:blur(12px)}}
+:root{{
+  --bg:#0a0a0a;--surface:#141414;--border:#252525;
+  --green:#25D366;--gg:rgba(37,211,102,.12);
+  --text:#f2f2f2;--muted:#666;
+}}
+body{{font-family:'Sora',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding-bottom:140px}}
+header{{background:var(--surface);border-bottom:1px solid var(--border);padding:16px 20px;text-align:center;position:sticky;top:0;z-index:200;backdrop-filter:blur(12px)}}
 header h1{{font-size:19px;font-weight:700}}
 header p{{color:var(--muted);font-size:10px;margin-top:3px;letter-spacing:2px;text-transform:uppercase}}
-.wa-bar{{display:flex;align-items:center;justify-content:center;gap:10px;background:var(--green-glow);border:1px solid var(--green);border-radius:12px;padding:13px 18px;margin:16px 16px 4px;color:var(--green);font-size:13px;font-weight:600;text-decoration:none;transition:background .2s}}
-.wa-bar:hover{{background:rgba(37,211,102,.22)}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:14px;max-width:960px;margin:14px auto;padding:0 14px 60px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:14px;max-width:960px;margin:16px auto;padding:0 14px}}
 .card{{background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden;transition:transform .2s,border-color .2s;display:flex;flex-direction:column}}
 .card:hover{{transform:translateY(-3px);border-color:var(--green)}}
 .card img,.no-img{{width:100%;height:190px;object-fit:cover;display:block;background:#1c1c1c}}
@@ -853,28 +859,168 @@ header p{{color:var(--muted);font-size:10px;margin-top:3px;letter-spacing:2px;te
 .cd{{font-size:12px;color:var(--muted);line-height:1.6;flex:1;margin-bottom:12px}}
 .cf{{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}}
 .price{{font-size:16px;font-weight:700;color:var(--green)}}
-.btn-order{{display:inline-flex;align-items:center;gap:5px;background:var(--green);color:#000;text-decoration:none;font-weight:700;font-size:11px;padding:8px 13px;border-radius:8px;white-space:nowrap;transition:opacity .15s}}
-.btn-order:hover{{opacity:.85}}
+.btn-add{{display:inline-flex;align-items:center;gap:5px;background:var(--green);color:#000;border:none;font-family:'Sora',sans-serif;font-weight:700;font-size:11px;padding:8px 13px;border-radius:8px;cursor:pointer;transition:all .2s}}
+.btn-add:hover{{opacity:.85}}
+.btn-add.added{{background:#1a3a24;color:var(--green);border:1px solid var(--green)}}
 .btn-soldout{{background:#1a1a1a;color:var(--muted);border:1px solid var(--border);font-size:11px;font-weight:600;padding:8px 13px;border-radius:8px;cursor:not-allowed}}
-footer{{text-align:center;padding:22px;color:var(--muted);font-size:11px;border-top:1px solid var(--border)}}
+footer{{text-align:center;padding:22px;color:var(--muted);font-size:11px;border-top:1px solid var(--border);margin-top:20px}}
 footer a{{color:var(--green);text-decoration:none}}
+
+/* FLOATING CART BUTTON */
+.fab{{position:fixed;bottom:24px;right:20px;background:var(--green);color:#000;width:58px;height:58px;border-radius:50%;border:none;font-size:24px;cursor:pointer;z-index:400;box-shadow:0 4px 20px rgba(37,211,102,.4);display:none;align-items:center;justify-content:center;transition:transform .2s}}
+.fab:hover{{transform:scale(1.1)}}
+.fab.show{{display:flex}}
+.fab-cnt{{position:absolute;top:-4px;right:-4px;background:#ef4444;color:#fff;font-size:10px;font-weight:700;width:18px;height:18px;border-radius:50%;display:flex;align-items:center;justify-content:center}}
+
+/* CART DRAWER */
+.drawer{{position:fixed;bottom:0;left:0;right:0;background:#0c1a10;border-top:2px solid var(--green);padding:16px;z-index:300;transform:translateY(100%);transition:transform .3s ease;max-height:70vh;overflow-y:auto}}
+.drawer.open{{transform:translateY(0)}}
+.drawer-head{{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}}
+.drawer-title{{font-size:14px;font-weight:700;color:var(--green)}}
+.close-btn{{background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;line-height:1}}
+.cart-item{{display:flex;align-items:center;gap:8px;padding:10px 0;border-bottom:1px solid #1a2e20;font-size:13px}}
+.ci-name{{flex:1;color:var(--text);font-weight:600}}
+.ci-price{{color:var(--green);font-weight:700;min-width:80px;text-align:right}}
+.qty{{display:flex;align-items:center;gap:6px}}
+.qbtn{{background:#1a3a24;border:1px solid var(--green);color:var(--green);width:26px;height:26px;border-radius:6px;font-size:15px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center}}
+.qnum{{font-size:13px;font-weight:700;min-width:18px;text-align:center}}
+.cart-total{{display:flex;justify-content:space-between;font-size:15px;font-weight:700;margin:14px 0 12px}}
+.cart-total span:last-child{{color:var(--green);font-size:18px}}
+.wa-btn{{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;background:var(--green);color:#000;border:none;font-family:'Sora',sans-serif;font-weight:700;font-size:15px;padding:14px;border-radius:10px;cursor:pointer;transition:opacity .15s}}
+.wa-btn:hover{{opacity:.85}}
+.clr-btn{{display:block;width:100%;background:none;border:none;color:var(--muted);font-size:11px;font-family:'Sora',sans-serif;cursor:pointer;margin-top:10px;padding:4px}}
+.clr-btn:hover{{color:#ef4444}}
+.empty-msg{{color:var(--muted);font-size:13px;text-align:center;padding:20px 0}}
 </style>
 </head>
 <body>
+
 <header>
   <h1>{vendor_title}</h1>
   <p>Powered by The Tech Squad</p>
 </header>
-<a href="https://wa.me/{BOT_PHONE}" class="wa-bar" target="_blank">
-  💬 Chat with Jordan on WhatsApp
-</a>
+
 <div class="grid">{cards}</div>
-<footer>© The Tech Squad &nbsp;·&nbsp; <a href="https://wa.me/{BOT_PHONE}">WhatsApp Us</a></footer>
+
+<footer>The Tech Squad &nbsp;&middot;&nbsp; <a href="https://wa.me/{BOT_PHONE}">Chat with Jordan</a></footer>
+
+<!-- Floating Cart Button -->
+<button class="fab" id="fab" onclick="toggleDrawer()">
+  🛒<span class="fab-cnt" id="fabCnt">0</span>
+</button>
+
+<!-- Cart Drawer -->
+<div class="drawer" id="drawer">
+  <div class="drawer-head">
+    <span class="drawer-title">Your Cart</span>
+    <button class="close-btn" onclick="toggleDrawer()">&#x2715;</button>
+  </div>
+  <div id="cartList"></div>
+  <div class="cart-total">
+    <span>Total</span>
+    <span id="cartTotal">NGN 0</span>
+  </div>
+  <button class="wa-btn" onclick="sendToWA()">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347z"/>
+      <path d="M12 0C5.373 0 0 5.373 0 12c0 2.127.558 4.126 1.533 5.857L.057 23.743a.75.75 0 00.914.914l5.886-1.476A11.945 11.945 0 0012 24c6.627 0 12-5.373 12-12S18.627 0 12 0zm0 22c-1.907 0-3.698-.528-5.228-1.443l-.374-.222-3.893.976.992-3.786-.245-.389A9.96 9.96 0 012 12C2 6.477 6.477 2 12 2s10 4.477 10 10-4.477 10-10 10z"/>
+    </svg>
+    Send Order to WhatsApp
+  </button>
+  <button class="clr-btn" onclick="clearCart()">Clear cart</button>
+</div>
+
+<script>
+var cart = {{}};
+
+function addToCart(name, price) {{
+  cart[name] = cart[name] || {{price: price, qty: 0}};
+  cart[name].qty += 1;
+  renderCart();
+  // Button feedback
+  document.querySelectorAll('.btn-add').forEach(function(b) {{
+    if (b.getAttribute('onclick') && b.getAttribute('onclick').indexOf(name) !== -1) {{
+      b.textContent = 'Added!';
+      b.classList.add('added');
+      setTimeout(function() {{
+        b.textContent = 'Add to Cart';
+        b.classList.remove('added');
+      }}, 1000);
+    }}
+  }});
+  openDrawer();
+}}
+
+function changeQty(name, d) {{
+  if (!cart[name]) return;
+  cart[name].qty += d;
+  if (cart[name].qty <= 0) delete cart[name];
+  renderCart();
+  if (Object.keys(cart).length === 0) closeDrawer();
+}}
+
+function clearCart() {{
+  cart = {{}};
+  renderCart();
+  closeDrawer();
+}}
+
+function renderCart() {{
+  var names  = Object.keys(cart);
+  var total  = 0;
+  var count  = 0;
+  var html   = '';
+  names.forEach(function(n) {{
+    var v    = cart[n];
+    var sub  = v.price * v.qty;
+    total   += sub;
+    count   += v.qty;
+    html    += '<div class="cart-item">'
+             + '<span class="ci-name">' + n + '</span>'
+             + '<div class="qty">'
+             + '<button class="qbtn" onclick="changeQty(\'' + n.replace(/'/g,"\\'") + '\',-1)">-</button>'
+             + '<span class="qnum">' + v.qty + '</span>'
+             + '<button class="qbtn" onclick="changeQty(\'' + n.replace(/'/g,"\\'") + '\',1)">+</button>'
+             + '</div>'
+             + '<span class="ci-price">NGN ' + sub.toLocaleString() + '</span>'
+             + '</div>';
+  }});
+  if (html === '') html = '<div class="empty-msg">No items yet</div>';
+  document.getElementById('cartList').innerHTML  = html;
+  document.getElementById('cartTotal').textContent = 'NGN ' + total.toLocaleString();
+  document.getElementById('fabCnt').textContent  = count;
+  var fab = document.getElementById('fab');
+  if (count > 0) fab.classList.add('show');
+  else fab.classList.remove('show');
+}}
+
+function openDrawer()  {{ document.getElementById('drawer').classList.add('open'); }}
+function closeDrawer() {{ document.getElementById('drawer').classList.remove('open'); }}
+function toggleDrawer(){{ document.getElementById('drawer').classList.toggle('open'); }}
+
+function sendToWA() {{
+  var names = Object.keys(cart);
+  if (names.length === 0) {{ alert('Your cart is empty!'); return; }}
+  var total = 0;
+  var msg   = 'Hi Jordan! I would like to order:\\n\\n';
+  names.forEach(function(n) {{
+    var v   = cart[n];
+    var sub = v.price * v.qty;
+    total  += sub;
+    msg    += v.qty + 'x ' + n + ' - NGN ' + sub.toLocaleString() + '\\n';
+  }});
+  msg += '\\nTotal: NGN ' + total.toLocaleString();
+  msg += '\\n\\nPlease confirm my order!';
+  window.open('https://wa.me/{BOT_PHONE}?text=' + encodeURIComponent(msg), '_blank');
+}}
+</script>
+
 </body>
 </html>"""
+        return page
 
     except Exception as e:
-        print(f"[Shop] {e}")
+        print(f"[Shop] {{e}}")
         return "Storefront is updating.", 500
 
 
