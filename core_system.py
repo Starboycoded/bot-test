@@ -232,7 +232,10 @@ def get_order_history(sc, phone: str):
 def save_session_state(sc, phone: str, session: dict):
     """Save checkout stage + cart to Sheets so restarts don't lose it."""
     try:
-        ws   = sc.open("TechSquad").worksheet("Sessions")
+        try:
+            ws = sc.open("TechSquad").worksheet("Sessions")
+        except Exception:
+            return  # Sessions tab not created yet — skip silently
         rows = ws.get_all_records()
         phone = clean_phone(phone)
         idx  = next(
@@ -259,7 +262,11 @@ def save_session_state(sc, phone: str, session: dict):
 def load_session_state(sc, phone: str) -> dict | None:
     """Load saved checkout state from Sheets after a restart."""
     try:
-        rows = sc.open("TechSquad").worksheet("Sessions").get_all_records()
+        try:
+            ws = sc.open("TechSquad").worksheet("Sessions")
+        except Exception:
+            return None  # Sessions tab not created yet — skip silently
+        rows = ws.get_all_records()
         phone = clean_phone(phone)
         row  = next((r for r in rows if clean_phone(str(r.get("Phone", ""))) == phone), None)
         if not row:
@@ -292,7 +299,10 @@ def load_session_state(sc, phone: str) -> dict | None:
 def clear_session_state(sc, phone: str):
     """Clear saved session after order is complete."""
     try:
-        ws   = sc.open("TechSquad").worksheet("Sessions")
+        try:
+            ws = sc.open("TechSquad").worksheet("Sessions")
+        except Exception:
+            return  # Sessions tab not created yet — skip silently
         rows = ws.get_all_records()
         idx  = next(
             (i + 2 for i, r in enumerate(rows) if str(r.get("Phone", "")) == str(phone)),
@@ -637,10 +647,7 @@ def process_conversation(uid: str, text: str):
         if any(t in text_lower for t in CHECKOUT_TRIGGERS):
             cart = session.get("cart", {})
             if not cart:
-                green_api.sending.sendMessage(
-                    uid,
-                    f"Your cart is empty! 🛒\nBrowse here: {CATALOG_URL}"
-                )
+                green_api.sending.sendMessage(send_phone(uid), f"Your cart is empty! 🛒\nBrowse here: {CATALOG_URL}")
                 return
             profile = get_profile(sc, uid)
             if profile:
@@ -757,9 +764,7 @@ def webhook():
             return "OK", 200
 
         if msg_type in MEDIA_TYPES:
-            green_api.sending.sendMessage(
-                uid, "I can only read text. Please type your request 📝"
-            )
+            green_api.sending.sendMessage(send_phone(uid), "I can only read text. Please type your request 📝")
             return "OK", 200
 
         text = (
