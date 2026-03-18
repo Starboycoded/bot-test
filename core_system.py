@@ -630,97 +630,45 @@ def process_conversation(uid: str, text: str):
         inventory  = get_inventory(sc)
         text_lower = text.lower().strip()
 
-        # FIX [3]: Restore session from Sheets if RAM was wiped by restart
+        # ── STEP 1: Restore session from Sheets if Render restarted ──
         if session.get("stage") == "browsing" and not session.get("cart"):
             saved = load_session_state(sc, uid)
             if saved and saved.get("stage") != "browsing":
                 session.update(saved)
-                print(f"[Session] Restored {uid} from Sheets: {saved['stage']}")
+                print(f"[Session] Restored {uid}: {saved['stage']}")
 
-        # ── 1. Checkout state machine ──
+        # ── STEP 2: Checkout state machine (name/address steps) ──
         state_reply = handle_checkout_state(uid, text, session, sc)
         if state_reply:
             green_api.sending.sendMessage(send_phone(uid), state_reply)
             return
 
-        # ── 2a. Storefront order auto-detection ──
-        # When customer taps "Send Order to WhatsApp" from storefront
-        # message starts with "Hi Jordan! I would like to order"
-        is_storefront_order = (
-            "i would like to order" in text_lower or
-            "please confirm my order" in text_lower
-        )
-
-        # ── 2. Checkout trigger ──
-        if any(t in text_lower for t in CHECKOUT_TRIGGERS) or (is_storefront_order and not session.get("cart")):
-            cart = session.get("cart", {})
-            if not cart:
-                green_api.sending.sendMessage(send_phone(uid), f"Your cart is empty! 🛒\nBrowse here: {CATALOG_URL}")
-                return
-            profile = get_profile(sc, uid)
-            if profile:
-                session["stage"]         = "awaiting_address_confirm"
-                session["name"]          = profile.get("Name", "")
-                session["saved_address"] = profile.get("Address", "")
-                reply = (
-                    f"Here's your cart:\n{cart_display(cart, inventory)}\n\n"
-                    f"Deliver to saved address?\n📍 *{profile.get('Address')}*\n\n"
-                    f"Reply *YES* to confirm or send a new address."
-                )
-            else:
-                session["stage"] = "awaiting_name"
-                reply = (
-                    f"Here's your cart:\n{cart_display(cart, inventory)}\n\n"
-                    f"What's your full name for delivery?"
-                )
-            save_session_state(sc, uid, session)   # FIX [3]
-            green_api.sending.sendMessage(send_phone(uid), reply)
-            return
-
-        # ── 3. Order tracking ──
-        if any(t in text_lower for t in TRACK_TRIGGERS):
-            history = get_order_history(sc, uid)
-            if history:
-                last  = history[-1]
-                reply = (
-                    f"Latest order 📦\n\n"
-                    f"ID: *{last.get('OrderID')}*\n"
-                    f"Items: {last.get('Items')}\n"
-                    f"Status: *{last.get('Status')}*\n"
-                    f"Date: {last.get('Date')}"
-                )
-            else:
-                reply = "No orders found for your number yet. 🤔"
-            green_api.sending.sendMessage(send_phone(uid), reply)
-            return
-
-        # ── 4. Detect cart additions ──
-        # Handles both natural text AND storefront pre-filled messages
-        # Storefront format: "1x Product Name - NGN 55,000"
+        # ── STEP 3: Parse cart items BEFORE checkout logic ──
+        import re as _re
         added_items = []
 
-        # Parse storefront order format first (most reliable)
-        import re as _re
-        storefront_matches = _re.findall(r"(\d+)x\s+(.+?)\s+-\s+NGN", text)
-        if storefront_matches:
-            for qty_str, item_name in storefront_matches:
+        # Parse storefront format: "2x Product Name - NGN 10,000"
+        sf_matches = _re.findall(r"(\d+)x\s+(.+?)\s+-\s+NGN", text)
+        if sf_matches:
+            for qty_str, item_name in sf_matches:
                 item_name = item_name.strip()
                 qty = int(qty_str)
-                # Match against inventory (case-insensitive, partial)
                 for p in inventory:
                     pname = p.get("Product", "")
                     try:
                         stock = int(p.get("Stock", 0))
                     except Exception:
                         stock = 0
-                    if stock > 0 and (pname.lower() == item_name.lower() or
-                                      pname.lower() in item_name.lower() or
-                                      item_name.lower() in pname.lower()):
+                    if stock > 0 and (
+                        pname.lower() == item_name.lower() or
+                        pname.lower() in item_name.lower() or
+                        item_name.lower() in pname.lower()
+                    ):
                         session["cart"][pname] = session["cart"].get(pname, 0) + qty
                         added_items.append((pname, qty))
                         break
         else:
-            # Natural text detection (customer typing freely)
+            # Natural text: customer types product name
             for p in inventory:
                 pname = p.get("Product", "")
                 try:
@@ -728,7 +676,7 @@ def process_conversation(uid: str, text: str):
                 except Exception:
                     stock = 0
                 if stock > 0 and pname.lower() in text_lower:
-                    qty   = 1
+                    qty = 1
                     words = text_lower.replace("x", " ").split()
                     for word in words:
                         if word.isdigit():
@@ -737,37 +685,78 @@ def process_conversation(uid: str, text: str):
                     session["cart"][pname] = session["cart"].get(pname, 0) + qty
                     added_items.append((pname, qty))
 
-        # Save cart state after additions
         if added_items:
-            save_session_state(sc, uid, session)   # FIX [3]
+            save_session_state(sc, uid, session)
 
-        # ── 5. AI reply ──
-        # FIX [4]: Use cached profile
+        # ── STEP 4: Checkout trigger ──
+        is_order_msg = (
+            "i would like to order" in text_lower or
+            "please confirm my order" in text_lower
+        )
+        if any(t in text_lower for t in CHECKOUT_TRIGGERS) or is_order_msg:
+            cart = session.get("cart", {})
+            if not cart:
+                msg = "Your cart is empty! Browse here: " + CATALOG_URL
+                green_api.sending.sendMessage(send_phone(uid), msg)
+                return
+            profile = get_profile(sc, uid)
+            if profile:
+                session["stage"]         = "awaiting_address_confirm"
+                session["name"]          = profile.get("Name", "")
+                session["saved_address"] = profile.get("Address", "")
+                saved_addr = profile.get("Address", "")
+                reply = "Here's your cart:\n" + cart_display(cart, inventory)
+                reply += "\n\nDeliver to saved address?\n" + saved_addr
+                reply += "\n\nReply YES to confirm or send a new address."
+            else:
+                session["stage"] = "awaiting_name"
+                reply = "Here's your cart:\n" + cart_display(cart, inventory)
+                reply += "\n\nWhat's your full name for delivery?"
+            save_session_state(sc, uid, session)
+            green_api.sending.sendMessage(send_phone(uid), reply)
+            return
+
+        # ── STEP 5: Order tracking ──
+        if any(t in text_lower for t in TRACK_TRIGGERS):
+            order_hist = get_order_history(sc, uid)
+            if order_hist:
+                last = order_hist[-1]
+                reply = (
+                    "Latest order\n\n"
+                    "ID: " + str(last.get("OrderID", "")) + "\n"
+                    "Items: " + str(last.get("Items", "")) + "\n"
+                    "Status: " + str(last.get("Status", "")) + "\n"
+                    "Date: " + str(last.get("Date", ""))
+                )
+            else:
+                reply = "No orders found for your number yet."
+            green_api.sending.sendMessage(send_phone(uid), reply)
+            return
+
+        # ── STEP 6: AI reply ──
         if session.get("profile") is None:
             session["profile"] = get_profile(sc, uid)
         profile = session["profile"]
 
-        # FIX [1] + [2]: Shorter prompt + limited history
         system_prompt = build_prompt(inventory, profile, session["cart"])
         session["history"].append({"role": "user", "content": text})
-        session["history"] = session["history"][-HISTORY_LIMIT:]   # FIX [2]
+        session["history"] = session["history"][-HISTORY_LIMIT:]
 
         reply = ask_ai(system_prompt, session["history"])
         session["history"].append({"role": "assistant", "content": reply})
 
-        # ── 6. Upsell once ──
+        # ── STEP 7: Upsell once per order ──
         if added_items and not session.get("upsell_done"):
             suggestion = find_upsell(session["cart"], inventory)
             if suggestion:
-                pm_   = price_map(inventory)
-                price = pm_.get(suggestion, 0)
-                reply += (
-                    f"\n\n💡 Customers who get {added_items[0][0]} "
-                    f"usually grab *{suggestion}* too (NGN {price:,}). Add it?"
-                )
+                pm_ = price_map(inventory)
+                uprice = pm_.get(suggestion, 0)
+                reply += "\n\nCustomers who get " + added_items[0][0]
+                reply += " usually grab " + suggestion + " too (NGN " + f"{uprice:,}" + "). Add it?"
                 session["upsell_done"] = True
 
         green_api.sending.sendMessage(send_phone(uid), reply)
+
 
     except Exception as e:
         print(f"[Error] {uid}: {e}")
