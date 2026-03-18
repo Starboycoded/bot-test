@@ -75,10 +75,17 @@ CATALOG_URL       = os.environ.get("CATALOG_URL", "https://techsquad-bot-2-0.onr
 AI_ENGINE  = os.environ.get("AI_ENGINE", "groq").lower()
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# FIX: Strip @c.us suffix that Green API adds to phone numbers
+# FIX: Phone number helpers
 def clean_phone(phone: str) -> str:
-    """Green API sends phones as 2349012345678@c.us — strip the suffix."""
-    return str(phone).replace("@c.us", "").replace("@g.us", "").strip()
+    """Strip @c.us for internal storage and matching."""
+    return str(phone).replace("@c.us", "").replace("@g.us", "").replace("@lid", "").strip()
+
+def send_phone(phone: str) -> str:
+    """Add @c.us back for sending via Green API."""
+    phone = clean_phone(phone)
+    if phone and not phone.endswith("@c.us"):
+        phone = phone + "@c.us"
+    return phone
 
 
 green_api = API.GreenApi(
@@ -607,7 +614,7 @@ def process_conversation(uid: str, text: str):
     try:
         sc = connect_sheets()
         if not sc:
-            green_api.sending.sendMessage(uid, "Database syncing. Try again shortly.")
+            green_api.sending.sendMessage(send_phone(uid), "Database syncing. Try again shortly.")
             return
 
         inventory  = get_inventory(sc)
@@ -623,7 +630,7 @@ def process_conversation(uid: str, text: str):
         # ── 1. Checkout state machine ──
         state_reply = handle_checkout_state(uid, text, session, sc)
         if state_reply:
-            green_api.sending.sendMessage(uid, state_reply)
+            green_api.sending.sendMessage(send_phone(uid), state_reply)
             return
 
         # ── 2. Checkout trigger ──
@@ -652,7 +659,7 @@ def process_conversation(uid: str, text: str):
                     f"What's your full name for delivery?"
                 )
             save_session_state(sc, uid, session)   # FIX [3]
-            green_api.sending.sendMessage(uid, reply)
+            green_api.sending.sendMessage(send_phone(uid), reply)
             return
 
         # ── 3. Order tracking ──
@@ -669,7 +676,7 @@ def process_conversation(uid: str, text: str):
                 )
             else:
                 reply = "No orders found for your number yet. 🤔"
-            green_api.sending.sendMessage(uid, reply)
+            green_api.sending.sendMessage(send_phone(uid), reply)
             return
 
         # ── 4. Detect cart additions ──
@@ -720,13 +727,13 @@ def process_conversation(uid: str, text: str):
                 )
                 session["upsell_done"] = True
 
-        green_api.sending.sendMessage(uid, reply)
+        green_api.sending.sendMessage(send_phone(uid), reply)
 
     except Exception as e:
         print(f"[Error] {uid}: {e}")
         traceback.print_exc()
         try:
-            green_api.sending.sendMessage(uid, "Something went wrong. Please try again.")
+            green_api.sending.sendMessage(send_phone(uid), "Something went wrong. Please try again.")
         except Exception:
             pass
     finally:
@@ -1052,7 +1059,7 @@ def broadcast():
         if not phone:
             continue
         try:
-            green_api.sending.sendMessage(phone, msg)
+            green_api.sending.sendMessage(send_phone(phone), msg)
             sent        += 1
             hourly_count += 1
             time.sleep(BROADCAST_DELAY)   # FIX [6]: 3s gap (was 1.2s)
