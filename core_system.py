@@ -643,8 +643,16 @@ def process_conversation(uid: str, text: str):
             green_api.sending.sendMessage(send_phone(uid), state_reply)
             return
 
+        # ── 2a. Storefront order auto-detection ──
+        # When customer taps "Send Order to WhatsApp" from storefront
+        # message starts with "Hi Jordan! I would like to order"
+        is_storefront_order = (
+            "i would like to order" in text_lower or
+            "please confirm my order" in text_lower
+        )
+
         # ── 2. Checkout trigger ──
-        if any(t in text_lower for t in CHECKOUT_TRIGGERS):
+        if any(t in text_lower for t in CHECKOUT_TRIGGERS) or (is_storefront_order and not session.get("cart")):
             cart = session.get("cart", {})
             if not cart:
                 green_api.sending.sendMessage(send_phone(uid), f"Your cart is empty! 🛒\nBrowse here: {CATALOG_URL}")
@@ -687,22 +695,47 @@ def process_conversation(uid: str, text: str):
             return
 
         # ── 4. Detect cart additions ──
+        # Handles both natural text AND storefront pre-filled messages
+        # Storefront format: "1x Product Name - NGN 55,000"
         added_items = []
-        for p in inventory:
-            pname = p.get("Product", "")
-            try:
-                stock = int(p.get("Stock", 0))
-            except Exception:
-                stock = 0
-            if stock > 0 and pname.lower() in text_lower:
-                qty   = 1
-                words = text_lower.replace("x", " ").split()
-                for word in words:
-                    if word.isdigit():
-                        qty = int(word)
+
+        # Parse storefront order format first (most reliable)
+        import re as _re
+        storefront_matches = _re.findall(r"(\d+)x\s+(.+?)\s+-\s+NGN", text)
+        if storefront_matches:
+            for qty_str, item_name in storefront_matches:
+                item_name = item_name.strip()
+                qty = int(qty_str)
+                # Match against inventory (case-insensitive, partial)
+                for p in inventory:
+                    pname = p.get("Product", "")
+                    try:
+                        stock = int(p.get("Stock", 0))
+                    except Exception:
+                        stock = 0
+                    if stock > 0 and (pname.lower() == item_name.lower() or
+                                      pname.lower() in item_name.lower() or
+                                      item_name.lower() in pname.lower()):
+                        session["cart"][pname] = session["cart"].get(pname, 0) + qty
+                        added_items.append((pname, qty))
                         break
-                session["cart"][pname] = session["cart"].get(pname, 0) + qty
-                added_items.append((pname, qty))
+        else:
+            # Natural text detection (customer typing freely)
+            for p in inventory:
+                pname = p.get("Product", "")
+                try:
+                    stock = int(p.get("Stock", 0))
+                except Exception:
+                    stock = 0
+                if stock > 0 and pname.lower() in text_lower:
+                    qty   = 1
+                    words = text_lower.replace("x", " ").split()
+                    for word in words:
+                        if word.isdigit():
+                            qty = int(word)
+                            break
+                    session["cart"][pname] = session["cart"].get(pname, 0) + qty
+                    added_items.append((pname, qty))
 
         # Save cart state after additions
         if added_items:
