@@ -786,7 +786,13 @@ def webhook():
             return "OK", 200
 
         if msg_type in MEDIA_TYPES:
-            green_api.sending.sendMessage(send_phone(uid), "I can only read text. Please type your request 📝")
+            media_reply = (
+                "Hey! 👋 I cannot view images or screenshots, but no worries! "
+                "Browse our full catalog here and tap any item to order: "
+                + CATALOG_URL
+                + " Or just type what you are looking for and I will help! 😊"
+            )
+            green_api.sending.sendMessage(send_phone(uid), media_reply)
             return "OK", 200
 
         text = (
@@ -940,12 +946,11 @@ var tt;
 function addItem(id){
   cart[id]=(cart[id]||0)+1;
   draw();
-  open_panel();
-  show_toast(P[id].name+' added!');
+  show_toast(P[id].name+' added! Tap cart to view Ὥ2');
   var c=document.getElementById('c'+id);
   if(c)c.classList.add('inc');
   var b=c?c.querySelector('.btn-add'):null;
-  if(b){b.textContent='Added \u2713';b.classList.add('flash');setTimeout(function(){b.textContent='Add to Cart';b.classList.remove('flash');},1400);}
+  if(b){b.textContent='Added ✓';b.classList.add('flash');setTimeout(function(){b.textContent='Add to Cart';b.classList.remove('flash');},1400);}
 }
 function inc(id){cart[id]=(cart[id]||0)+1;draw();}
 function dec(id){
@@ -1108,7 +1113,7 @@ def admin():
     low_stock       = [p.get("Product","") for p in inventory if int(p.get("Stock",0) or 0) <= 3]
     today           = time.strftime("%Y-%m-%d")
     tokens_today    = token_log.get(today, 0)
-    ai_label        = {"groq":"Groq LLaMA 3.3 (free)","gemini":"Gemini 1.5 Flash","claude":"Claude Sonnet"}.get(AI_ENGINE, AI_ENGINE)
+    ai_label        = {"groq":"CodedLabs AI","gemini":"CodedLabs AI","claude":"CodedLabs AI"}.get(AI_ENGINE, AI_ENGINE)
 
     sales_rows = ""
     for s in reversed(sales[-100:]):
@@ -1252,7 +1257,7 @@ def ping():
 def health():
     today  = time.strftime("%Y-%m-%d")
     tokens = token_log.get(today, 0)
-    engine = {"groq":"Groq (free)","gemini":"Gemini Flash","claude":"Claude Sonnet"}.get(AI_ENGINE, AI_ENGINE)
+    engine = {"groq":"CodedLabs AI","gemini":"CodedLabs AI","claude":"CodedLabs AI"}.get(AI_ENGINE, AI_ENGINE)
     return (
         f"System Online | AI: {engine} | "
         f"Tokens today: {tokens:,} | "
