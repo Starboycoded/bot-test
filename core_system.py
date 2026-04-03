@@ -1,21 +1,27 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║         THE TECH SQUAD — JORDAN BOT v4.1 (BUG FIXED)           ║
+║         THE TECH SQUAD — JORDAN BOT v4.2 (SQLITE SESSIONS)     ║
 ║                                                                  ║
-║  FIXES IN THIS VERSION:                                          ║
-║  [BF-1] Cart parsing now runs BEFORE checkout trigger check     ║
-║         (storefront orders were hitting empty cart error)        ║
-║  [BF-2] Upsell message now sent correctly (was appended after   ║
-║         message already sent — customer never saw it)           ║
-║  [BF-3] Sheets reconnect on token expiry (gc reset on error)    ║
-║  [BF-4] Python 3.9 compatible type hints (removed dict|None)    ║
-║  [BF-5] re import moved to top level (out of hot loop)          ║
-║  [BF-6] Session restore timeout tightened to 20 mins            ║
+║  WHAT CHANGED IN v4.2:                                           ║
+║  [SQ-1] Sessions moved from Google Sheets → SQLite              ║
+║         - Zero rate limit errors on sessions                    ║
+║         - Instant reads/writes (no network call)                ║
+║         - Auto-creates sessions.db on first run                 ║
+║         - No new dependencies (sqlite3 is built into Python)    ║
+║         - Sessions tab in Google Sheets no longer needed        ║
 ║                                                                  ║
-║  ALL PREVIOUS FIXES RETAINED:                                    ║
+║  ALL v4.1 FIXES RETAINED:                                        ║
+║  [BF-1] Cart parsing runs BEFORE checkout trigger check         ║
+║  [BF-2] Upsell message sent correctly                           ║
+║  [BF-3] Sheets reconnect on token expiry                        ║
+║  [BF-4] Python 3.9 compatible type hints                        ║
+║  [BF-5] re import at top level                                   ║
+║  [BF-6] Session restore timeout 20 mins                         ║
+║                                                                  ║
+║  ALL v4.0 FIXES RETAINED:                                        ║
 ║  [1]  Shrunk system prompt  (~800 tokens → ~280 tokens)         ║
 ║  [2]  History cut from 20 → 6 turns                             ║
-║  [3]  Session persistence in Google Sheets                      ║
+║  [3]  Session persistence (now SQLite, not Sheets)              ║
 ║  [4]  Profile cache per session                                  ║
 ║  [5]  Inventory cache 2 mins                                     ║
 ║  [6]  Broadcast rate limited (3s gap, max 100/hour)             ║
@@ -43,8 +49,7 @@
 ║    Customers   Phone, Name, Address, Date                       ║
 ║    Sales       OrderID, Phone, Name, Items,                     ║
 ║                Address, Status, Date                            ║
-║    Sessions    Phone, Stage, Name, Address,                     ║
-║                Cart, LastUpdated                                ║
+║    NOTE: Sessions tab no longer needed — handled by SQLite      ║
 ║                                                                  ║
 ║  AFTER DEPLOY — DO THIS:                                         ║
 ║    1. Go to cron-job.org (free)                                  ║
@@ -59,6 +64,7 @@ import re
 import time
 import uuid
 import json
+import sqlite3
 import traceback
 import threading
 import requests
@@ -83,6 +89,11 @@ CATALOG_URL       = os.environ.get("CATALOG_URL", "https://techsquad-bot-2-0.onr
 
 AI_ENGINE  = os.environ.get("AI_ENGINE", "groq").lower()
 GROQ_MODEL = "llama-3.3-70b-versatile"
+
+# SQLite DB path — lives on Render's local disk, survives restarts
+# within the same running instance. Wiped on full redeploy (that's fine —
+# sessions are short-lived and customers just restart their chat).
+SQLITE_DB = os.environ.get("SQLITE_DB_PATH", "sessions.db")
 
 # ── Phone helpers ─────────────────────────────────────
 def clean_phone(phone: str) -> str:
@@ -115,6 +126,7 @@ PROFILE_CACHE_TTL = 300
 HISTORY_LIMIT     = 6
 BROADCAST_DELAY   = 3.0
 BROADCAST_HOURLY  = 100
+SESSION_TIMEOUT   = 1200   # 20 minutes — stale sessions ignored on restore
 
 MEDIA_TYPES = (
     "imageMessage", "videoMessage", "audioMessage",
@@ -130,7 +142,7 @@ TRACK_TRIGGERS = [
     "order status", "my order", "check order"
 ]
 
-# BF-1: Pre-compiled regex for storefront cart parsing (moved to top level)
+# Pre-compiled regex for storefront cart parsing
 # Matches: "2x iPhone 15 Pro - NGN 850,000"
 STOREFRONT_CART_RE = re.compile(r"(\d+)x\s+(.+?)\s+-\s+NGN[\s\d,\.]+", re.MULTILINE)
 
@@ -152,10 +164,171 @@ def get_session(uid: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════
-# 3.  GOOGLE SHEETS
+# 3.  SQLITE SESSION STORE  [SQ-1]
+#
+#  Replaces the Google Sheets "Sessions" tab entirely.
+#  sqlite3 is built into Python — zero new dependencies.
+#  Thread-safe: each call opens its own connection with
+#  check_same_thread=False and WAL mode for concurrent reads.
+# ══════════════════════════════════════════════════════
+
+def _db_conn():
+    """Open a SQLite connection. WAL mode = safe concurrent reads/writes."""
+    conn = sqlite3.connect(SQLITE_DB, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_sqlite():
+    """
+    [SQ-1] Create the sessions table if it doesn't exist.
+    Called once at startup. Safe to call multiple times.
+    """
+    try:
+        with _db_conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    phone        TEXT PRIMARY KEY,
+                    stage        TEXT    DEFAULT 'browsing',
+                    name         TEXT    DEFAULT '',
+                    address      TEXT    DEFAULT '',
+                    cart         TEXT    DEFAULT '{}',
+                    last_updated INTEGER DEFAULT 0
+                )
+            """)
+            # Index for fast lookups by phone (already PK, but explicit)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sessions_phone
+                ON sessions (phone)
+            """)
+            conn.commit()
+        print(f"[SQLite] Sessions DB ready: {SQLITE_DB}")
+    except Exception as e:
+        print(f"[SQLite] Init failed: {e}")
+
+
+def save_session_state(sc, phone: str, session: dict):
+    """
+    [SQ-1] Save checkout stage + cart to SQLite.
+    sc param kept for API compatibility but not used here.
+    Instant — no network call, no rate limits.
+    """
+    phone = clean_phone(phone)
+    try:
+        cart_json = json.dumps(session.get("cart", {}))
+        now_ts    = int(time.time())
+        with _db_conn() as conn:
+            conn.execute("""
+                INSERT INTO sessions (phone, stage, name, address, cart, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(phone) DO UPDATE SET
+                    stage        = excluded.stage,
+                    name         = excluded.name,
+                    address      = excluded.address,
+                    cart         = excluded.cart,
+                    last_updated = excluded.last_updated
+            """, (
+                phone,
+                session.get("stage", "browsing"),
+                session.get("name", ""),
+                session.get("address", ""),
+                cart_json,
+                now_ts,
+            ))
+            conn.commit()
+    except Exception as e:
+        print(f"[SQLite] Save session failed: {e}")
+
+
+def load_session_state(sc, phone: str):
+    """
+    [SQ-1] Load saved checkout state from SQLite after a restart.
+    sc param kept for API compatibility but not used here.
+    Returns None if no session, session expired, or stage is browsing.
+    """
+    phone = clean_phone(phone)
+    try:
+        with _db_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE phone = ?", (phone,)
+            ).fetchone()
+
+        if not row:
+            return None
+
+        # Ignore stale sessions (older than SESSION_TIMEOUT seconds)
+        age = int(time.time()) - (row["last_updated"] or 0)
+        if age > SESSION_TIMEOUT:
+            return None
+
+        # Don't restore if already in browsing state — nothing to recover
+        if row["stage"] == "browsing":
+            return None
+
+        cart = {}
+        try:
+            cart = json.loads(row["cart"] or "{}")
+        except Exception:
+            pass
+
+        return {
+            "stage":   row["stage"],
+            "name":    row["name"],
+            "address": row["address"],
+            "cart":    cart,
+        }
+    except Exception as e:
+        print(f"[SQLite] Load session failed: {e}")
+        return None
+
+
+def clear_session_state(sc, phone: str):
+    """
+    [SQ-1] Reset session to browsing state after order completes.
+    sc param kept for API compatibility but not used here.
+    """
+    phone = clean_phone(phone)
+    try:
+        with _db_conn() as conn:
+            conn.execute("""
+                INSERT INTO sessions (phone, stage, name, address, cart, last_updated)
+                VALUES (?, 'browsing', '', '', '{}', ?)
+                ON CONFLICT(phone) DO UPDATE SET
+                    stage        = 'browsing',
+                    name         = '',
+                    address      = '',
+                    cart         = '{}',
+                    last_updated = excluded.last_updated
+            """, (phone, int(time.time())))
+            conn.commit()
+    except Exception as e:
+        print(f"[SQLite] Clear session failed: {e}")
+
+
+def cleanup_old_sessions():
+    """
+    [SQ-1] Delete sessions older than SESSION_TIMEOUT.
+    Called from /ping to keep the DB lean.
+    """
+    try:
+        cutoff = int(time.time()) - SESSION_TIMEOUT
+        with _db_conn() as conn:
+            deleted = conn.execute(
+                "DELETE FROM sessions WHERE last_updated < ?", (cutoff,)
+            ).rowcount
+            conn.commit()
+        if deleted:
+            print(f"[SQLite] Cleaned up {deleted} stale sessions")
+    except Exception as e:
+        print(f"[SQLite] Cleanup failed: {e}")
+
+
+# ══════════════════════════════════════════════════════
+# 4.  GOOGLE SHEETS  (Inventory, Customers, Sales only)
 # ══════════════════════════════════════════════════════
 def connect_sheets():
-    """BF-3: Reset gc on error so it reconnects instead of staying broken."""
+    """Reset gc on error so it reconnects instead of staying broken."""
     global gc
     if gc is None:
         try:
@@ -167,12 +340,11 @@ def connect_sheets():
             gc    = gspread.authorize(creds)
         except Exception as e:
             print(f"[Sheets] Connection failed: {e}")
-            gc = None  # BF-3: ensure gc stays None so next call retries
+            gc = None
     return gc
 
 
 def reset_sheets_connection():
-    """BF-3: Force reconnect on next call."""
     global gc
     gc = None
 
@@ -185,7 +357,7 @@ def get_inventory(sc):
             inventory_cache["last_updated"] = now
         except Exception as e:
             print(f"[Sheets] Inventory fetch failed: {e}")
-            reset_sheets_connection()  # BF-3: force reconnect on next call
+            reset_sheets_connection()
             return inventory_cache["data"] or []
     return inventory_cache["data"]
 
@@ -202,7 +374,7 @@ def get_profile(sc, phone: str):
         return profile
     except Exception as e:
         print(f"[Sheets] Profile fetch failed: {e}")
-        reset_sheets_connection()  # BF-3
+        reset_sheets_connection()
         return cached["data"] if cached else None
 
 
@@ -223,7 +395,7 @@ def save_profile(sc, phone: str, name: str, address: str):
         profile_cache.pop(phone, None)
     except Exception as e:
         print(f"[Sheets] Save profile failed: {e}")
-        reset_sheets_connection()  # BF-3
+        reset_sheets_connection()
 
 
 def log_order(sc, order_id, phone, name, items_text, address):
@@ -234,7 +406,7 @@ def log_order(sc, order_id, phone, name, items_text, address):
         ])
     except Exception as e:
         print(f"[Sheets] Log order failed: {e}")
-        reset_sheets_connection()  # BF-3
+        reset_sheets_connection()
 
 
 def get_order_history(sc, phone: str):
@@ -244,95 +416,12 @@ def get_order_history(sc, phone: str):
         return [r for r in rows if clean_phone(str(r.get("Phone", ""))) == phone]
     except Exception as e:
         print(f"[Sheets] Order history failed: {e}")
-        reset_sheets_connection()  # BF-3
+        reset_sheets_connection()
         return []
 
 
-def save_session_state(sc, phone: str, session: dict):
-    try:
-        try:
-            ws = sc.open("TechSquad").worksheet("Sessions")
-        except Exception:
-            return
-        rows  = ws.get_all_records()
-        phone = clean_phone(phone)
-        idx   = next(
-            (i + 2 for i, r in enumerate(rows) if clean_phone(str(r.get("Phone", ""))) == phone),
-            None
-        )
-        cart_json = json.dumps(session.get("cart", {}))
-        row = [
-            phone,
-            session.get("stage", "browsing"),
-            session.get("name", ""),
-            session.get("address", ""),
-            cart_json,
-            time.strftime("%Y-%m-%d %H:%M"),
-        ]
-        if idx:
-            ws.update(f"A{idx}:F{idx}", [row])
-        else:
-            ws.append_row(row)
-    except Exception as e:
-        print(f"[Sessions] Save failed: {e}")
-
-
-def load_session_state(sc, phone: str):
-    """BF-4: Removed dict|None type hint for Python 3.9 compatibility."""
-    try:
-        try:
-            ws = sc.open("TechSquad").worksheet("Sessions")
-        except Exception:
-            return None
-        rows  = ws.get_all_records()
-        phone = clean_phone(phone)
-        row   = next((r for r in rows if clean_phone(str(r.get("Phone", ""))) == phone), None)
-        if not row:
-            return None
-        last = row.get("LastUpdated", "")
-        if last:
-            try:
-                saved_ts = time.mktime(time.strptime(last, "%Y-%m-%d %H:%M"))
-                # BF-6: Tightened from 30 mins to 20 mins to avoid stale restores
-                if time.time() - saved_ts > 1200:
-                    return None
-            except Exception:
-                pass
-        cart = {}
-        try:
-            cart = json.loads(row.get("Cart", "{}"))
-        except Exception:
-            pass
-        return {
-            "stage":   row.get("Stage", "browsing"),
-            "name":    row.get("Name", ""),
-            "address": row.get("Address", ""),
-            "cart":    cart,
-        }
-    except Exception as e:
-        print(f"[Sessions] Load failed: {e}")
-        return None
-
-
-def clear_session_state(sc, phone: str):
-    try:
-        try:
-            ws = sc.open("TechSquad").worksheet("Sessions")
-        except Exception:
-            return
-        rows = ws.get_all_records()
-        idx  = next(
-            (i + 2 for i, r in enumerate(rows) if str(r.get("Phone", "")) == str(phone)),
-            None
-        )
-        if idx:
-            ws.update(f"A{idx}:F{idx}", [[phone, "browsing", "", "", "{}", time.strftime("%Y-%m-%d %H:%M")]])
-    except Exception as e:
-        print(f"[Sessions] Clear failed: {e}")
-
-
 # ══════════════════════════════════════════════════════
-# 4.  CART HELPERS
+# 5.  CART HELPERS
 # ══════════════════════════════════════════════════════
 def price_map(inventory: list) -> dict:
     return {p.get("Product"): int(p.get("Price", 0)) for p in inventory}
@@ -386,7 +475,7 @@ def find_upsell(cart: dict, inventory: list):
 
 
 # ══════════════════════════════════════════════════════
-# 5.  AI ENGINE
+# 6.  AI ENGINE
 # ══════════════════════════════════════════════════════
 def log_tokens(count: int):
     today = time.strftime("%Y-%m-%d")
@@ -484,7 +573,7 @@ def ask_ai(system_prompt: str, history: list) -> str:
 
 
 # ══════════════════════════════════════════════════════
-# 6.  SYSTEM PROMPT
+# 7.  SYSTEM PROMPT
 # ══════════════════════════════════════════════════════
 def build_prompt(inventory, profile, cart) -> str:
     available = []
@@ -529,7 +618,7 @@ RULES:
 
 
 # ══════════════════════════════════════════════════════
-# 7.  CHECKOUT STATE MACHINE
+# 8.  CHECKOUT STATE MACHINE
 # ══════════════════════════════════════════════════════
 def handle_checkout_state(uid: str, text: str, session: dict, sc):
     stage = session.get("stage", "browsing")
@@ -602,7 +691,7 @@ def _generate_receipt(uid: str, session: dict, sc) -> str:
 
 
 # ══════════════════════════════════════════════════════
-# 8.  MAIN CONVERSATION PROCESSOR
+# 9.  MAIN CONVERSATION PROCESSOR
 # ══════════════════════════════════════════════════════
 def process_conversation(uid: str, text: str):
     session = get_session(uid)
@@ -622,9 +711,9 @@ def process_conversation(uid: str, text: str):
         inventory  = get_inventory(sc)
         text_lower = text.lower().strip()
 
-        # ── STEP 1: Restore session from Sheets if Render restarted ──
-        # BF-6: Only restore if stage is browsing AND cart is empty AND
-        # the customer hasn't sent a message in this session yet
+        # ── STEP 1: Restore session from SQLite if server restarted ──
+        # Only restore if stage is browsing, cart is empty, and no
+        # history yet in this session (fresh RAM session after restart)
         if (session.get("stage") == "browsing"
                 and not session.get("cart")
                 and not session.get("history")):
@@ -634,21 +723,16 @@ def process_conversation(uid: str, text: str):
                 print(f"[Session] Restored {uid}: {saved['stage']}")
 
         # ── STEP 2: Checkout state machine (name/address steps) ──
-        # Must run before cart parsing — if we're mid-checkout,
-        # the customer's reply is their name or address, not a product
         state_reply = handle_checkout_state(uid, text, session, sc)
         if state_reply:
             green_api.sending.sendMessage(send_phone(uid), state_reply)
             return
 
-        # ── STEP 3: Parse cart items ─────────────────────────────
-        # BF-1: THIS MUST RUN BEFORE the checkout trigger check.
-        # The storefront message contains BOTH cart items AND
-        # "please confirm my order" — we must add items to cart first,
-        # THEN handle the checkout trigger in Step 4.
+        # ── STEP 3: Parse cart items ──────────────────────────────
+        # MUST run before checkout trigger check (BF-1).
+        # Storefront message has items AND "please confirm my order".
         added_items = []
 
-        # Try storefront format first: "2x Product Name - NGN 850,000"
         sf_matches = STOREFRONT_CART_RE.findall(text)
         if sf_matches:
             for qty_str, item_name in sf_matches:
@@ -669,7 +753,6 @@ def process_conversation(uid: str, text: str):
                         added_items.append((pname, qty))
                         break
         else:
-            # Natural text: customer types product name
             for p in inventory:
                 pname = p.get("Product", "")
                 try:
@@ -690,8 +773,6 @@ def process_conversation(uid: str, text: str):
             save_session_state(sc, uid, session)
 
         # ── STEP 4: Checkout trigger ──────────────────────────────
-        # BF-1: Now that cart is populated (Step 3), checkout trigger
-        # will find items in the cart correctly.
         is_order_msg = (
             "i would like to order" in text_lower
             or "please confirm my order" in text_lower
@@ -749,8 +830,7 @@ def process_conversation(uid: str, text: str):
         session["history"].append({"role": "assistant", "content": reply})
 
         # ── STEP 7: Upsell once per order ─────────────────────────
-        # BF-2: Build the full reply string FIRST, then send once.
-        # Previously upsell was appended after sendMessage was already called.
+        # Build full reply first, then send once (BF-2)
         if added_items and not session.get("upsell_done"):
             suggestion = find_upsell(session["cart"], inventory)
             if suggestion:
@@ -762,7 +842,6 @@ def process_conversation(uid: str, text: str):
                 )
                 session["upsell_done"] = True
 
-        # Single send — after all reply modifications are done
         green_api.sending.sendMessage(send_phone(uid), reply)
 
     except Exception as e:
@@ -777,7 +856,7 @@ def process_conversation(uid: str, text: str):
 
 
 # ══════════════════════════════════════════════════════
-# 9.  WEBHOOK
+# 10. WEBHOOK
 # ══════════════════════════════════════════════════════
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -823,7 +902,7 @@ def webhook():
 
 
 # ══════════════════════════════════════════════════════
-# 10. STOREFRONT
+# 11. STOREFRONT
 # ══════════════════════════════════════════════════════
 @app.route("/shop/<vendor_name>")
 def shop(vendor_name):
@@ -1056,7 +1135,7 @@ function send_order(){
 
 
 # ══════════════════════════════════════════════════════
-# 11. BROADCAST
+# 12. BROADCAST
 # ══════════════════════════════════════════════════════
 @app.route("/broadcast", methods=["POST"])
 def broadcast():
@@ -1094,7 +1173,7 @@ def broadcast():
 
 
 # ══════════════════════════════════════════════════════
-# 12. ADMIN DASHBOARD
+# 13. ADMIN DASHBOARD
 # ══════════════════════════════════════════════════════
 @app.route("/admin")
 def admin():
@@ -1116,6 +1195,16 @@ def admin():
     today           = time.strftime("%Y-%m-%d")
     tokens_today    = token_log.get(today, 0)
     ai_label        = {"groq":"CodedLabs AI","gemini":"CodedLabs AI","claude":"CodedLabs AI"}.get(AI_ENGINE, AI_ENGINE)
+
+    # Active sessions count from SQLite
+    try:
+        with _db_conn() as conn:
+            active_sessions = conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE stage != 'browsing' AND last_updated > ?",
+                (int(time.time()) - SESSION_TIMEOUT,)
+            ).fetchone()[0]
+    except Exception:
+        active_sessions = len(sessions)
 
     sales_rows = ""
     for s in reversed(sales[-100:]):
@@ -1191,6 +1280,7 @@ textarea:focus{{border-color:var(--g)}}
     <div class="stat"><div class="stat-n" style="color:#22c55e">{delivered}</div><div class="stat-l">Delivered</div></div>
     <div class="stat"><div class="stat-n" style="color:#3b82f6">{total_customers}</div><div class="stat-l">Customers</div></div>
     <div class="stat"><div class="stat-n" style="color:#a78bfa">{tokens_today:,}</div><div class="stat-l">Tokens Today</div></div>
+    <div class="stat"><div class="stat-n" style="color:#fb923c">{active_sessions}</div><div class="stat-l">Active Checkouts</div></div>
   </div>
   {low_banner}
   <div class="card">
@@ -1234,7 +1324,7 @@ async function send(){{
 
 
 # ══════════════════════════════════════════════════════
-# 13. UTILITY ENDPOINTS
+# 14. UTILITY ENDPOINTS
 # ══════════════════════════════════════════════════════
 @app.route("/refresh")
 def refresh():
@@ -1248,6 +1338,9 @@ def refresh():
 
 @app.route("/ping")
 def ping():
+    # Piggyback SQLite cleanup on the keep-alive ping
+    # Runs every 10 mins via cron-job.org — keeps DB lean automatically
+    cleanup_old_sessions()
     return "pong", 200
 
 
@@ -1262,6 +1355,12 @@ def health():
         f"Active sessions: {len(sessions)}"
     ), 200
 
+
+# ══════════════════════════════════════════════════════
+# 15. STARTUP
+# ══════════════════════════════════════════════════════
+# Initialise SQLite on startup — creates sessions.db if it doesn't exist
+init_sqlite()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
