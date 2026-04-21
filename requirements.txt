@@ -1,6 +1,5 @@
 flask
 gunicorn
-whatsapp-api-client-python
 gspread
 oauth2client
 requests
