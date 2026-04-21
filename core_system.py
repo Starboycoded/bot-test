@@ -1,36 +1,20 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║         THE TECH SQUAD — JORDAN BOT v4.2 (SQLITE SESSIONS)     ║
+║         THE TECH SQUAD — JORDAN BOT v4.0 (OPTIMISED)           ║
 ║                                                                  ║
-║  WHAT CHANGED IN v4.2:                                           ║
-║  [SQ-1] Sessions moved from Google Sheets → SQLite              ║
-║         - Zero rate limit errors on sessions                    ║
-║         - Instant reads/writes (no network call)                ║
-║         - Auto-creates sessions.db on first run                 ║
-║         - No new dependencies (sqlite3 is built into Python)    ║
-║         - Sessions tab in Google Sheets no longer needed        ║
-║                                                                  ║
-║  ALL v4.1 FIXES RETAINED:                                        ║
-║  [BF-1] Cart parsing runs BEFORE checkout trigger check         ║
-║  [BF-2] Upsell message sent correctly                           ║
-║  [BF-3] Sheets reconnect on token expiry                        ║
-║  [BF-4] Python 3.9 compatible type hints                        ║
-║  [BF-5] re import at top level                                   ║
-║  [BF-6] Session restore timeout 20 mins                         ║
-║                                                                  ║
-║  ALL v4.0 FIXES RETAINED:                                        ║
+║  FIXES APPLIED:                                                  ║
 ║  [1]  Shrunk system prompt  (~800 tokens → ~280 tokens)         ║
-║  [2]  History cut from 20 → 6 turns                             ║
-║  [3]  Session persistence (now SQLite, not Sheets)              ║
-║  [4]  Profile cache per session                                  ║
-║  [5]  Inventory cache 2 mins                                     ║
+║  [2]  History cut from 20 → 6 turns  (saves ~500 tokens/msg)   ║
+║  [3]  Session persistence in Google Sheets (survives restarts)  ║
+║  [4]  Profile cache per session (no Sheets hit every message)   ║
+║  [5]  Inventory cache reduced to 2 mins for active clients      ║
 ║  [6]  Broadcast rate limited (3s gap, max 100/hour)             ║
-║  [7]  /refresh endpoint                                          ║
-║  [8]  /ping endpoint for cron-job.org                           ║
-║  [9]  AI engine switcher (groq/gemini/claude)                   ║
-║  [10] Token usage logger                                         ║
-║  [11] Single gunicorn worker                                     ║
-║  [12] Graceful error recovery                                    ║
+║  [7]  /refresh endpoint to clear inventory cache instantly      ║
+║  [8]  /ping endpoint for cron-job.org keep-alive                ║
+║  [9]  Auto AI switching: Groq free → Gemini when needed         ║
+║  [10] Token usage logger per message                            ║
+║  [11] Single gunicorn worker (no race conditions)               ║
+║  [12] Graceful error recovery at every step                     ║
 ║                                                                  ║
 ║  RENDER ENV VARS:                                                ║
 ║    GREEN_ID           from console.green-api.com                ║
@@ -49,7 +33,8 @@
 ║    Customers   Phone, Name, Address, Date                       ║
 ║    Sales       OrderID, Phone, Name, Items,                     ║
 ║                Address, Status, Date                            ║
-║    NOTE: Sessions tab no longer needed — handled by SQLite      ║
+║    Sessions    Phone, Stage, Name, Address,                     ║
+║                Cart, LastUpdated                                ║
 ║                                                                  ║
 ║  AFTER DEPLOY — DO THIS:                                         ║
 ║    1. Go to cron-job.org (free)                                  ║
@@ -60,16 +45,16 @@
 """
 
 import os
-import re
 import time
 import uuid
 import json
-import sqlite3
 import traceback
 import threading
+import random
 import requests
+from urllib.parse import quote
 from flask import Flask, request, jsonify
-from whatsapp_api_client_python import API
+# Meta Cloud API — no more Green API
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -87,46 +72,68 @@ ADMIN_SECRET      = os.environ.get("ADMIN_SECRET", "techsquad2025")
 BOT_PHONE         = os.environ.get("BOT_PHONE", "2347025041149")
 CATALOG_URL       = os.environ.get("CATALOG_URL", "https://techsquad-bot-2-0.onrender.com/shop/tech_squad")
 
+# AI_ENGINE: groq (free) | gemini (cheap) | claude (premium)
 AI_ENGINE  = os.environ.get("AI_ENGINE", "groq").lower()
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# SQLite DB path — lives on Render's local disk, survives restarts
-# within the same running instance. Wiped on full redeploy (that's fine —
-# sessions are short-lived and customers just restart their chat).
-SQLITE_DB = os.environ.get("SQLITE_DB_PATH", "sessions.db")
-
-# ── Phone helpers ─────────────────────────────────────
+# FIX: Phone number helpers
 def clean_phone(phone: str) -> str:
+    """Strip @c.us for internal storage and matching."""
     return str(phone).replace("@c.us", "").replace("@g.us", "").replace("@lid", "").strip()
 
 def send_phone(phone: str) -> str:
+    """Add @c.us back for sending via Green API."""
     phone = clean_phone(phone)
     if phone and not phone.endswith("@c.us"):
         phone = phone + "@c.us"
     return phone
 
 
-green_api = API.GreenApi(
-    GREEN_ID, GREEN_TOKEN,
-    "https://7103.api.greenapi.com",
-    "https://7103.media.greenapi.com"
-)
+# Meta Cloud API credentials
+WHATSAPP_TOKEN    = os.environ.get("WHATSAPP_TOKEN", "")
+PHONE_NUMBER_ID   = os.environ.get("PHONE_NUMBER_ID", "989005180973554")
+META_API_URL      = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
+
+def send_whatsapp(to: str, message: str):
+    """Send message via Meta Cloud API."""
+    phone = clean_phone(to)
+    try:
+        resp = requests.post(
+            META_API_URL,
+            headers={
+                "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "messaging_product": "whatsapp",
+                "to": phone,
+                "type": "text",
+                "text": {"body": message}
+            },
+            timeout=30
+        )
+        data = resp.json()
+        if resp.status_code != 200:
+            print(f"[Meta API] Error: {data}")
+        return data
+    except Exception as e:
+        print(f"[Meta API] {e}")
+        return None
 
 # ══════════════════════════════════════════════════════
 # 2.  IN-MEMORY STORE  +  CACHES
 # ══════════════════════════════════════════════════════
-sessions        = {}
+sessions        = {}   # RAM sessions (fast access)
 gc              = None
 inventory_cache = {"data": None, "last_updated": 0}
-profile_cache   = {}
-token_log       = {}
+profile_cache   = {}   # {phone: {profile_dict, fetched_at}}
+token_log       = {}   # {date: total_tokens}
 
-CACHE_TTL         = 120
-PROFILE_CACHE_TTL = 300
-HISTORY_LIMIT     = 6
-BROADCAST_DELAY   = 3.0
-BROADCAST_HOURLY  = 100
-SESSION_TIMEOUT   = 1200   # 20 minutes — stale sessions ignored on restore
+CACHE_TTL         = 120   # inventory refresh every 2 mins
+PROFILE_CACHE_TTL = 300   # profile cache 5 mins
+HISTORY_LIMIT     = 6     # only keep last 6 turns (was 20)
+BROADCAST_DELAY   = 3.0   # seconds between broadcast messages
+BROADCAST_HOURLY  = 100   # max messages per hour in broadcast
 
 MEDIA_TYPES = (
     "imageMessage", "videoMessage", "audioMessage",
@@ -142,10 +149,6 @@ TRACK_TRIGGERS = [
     "order status", "my order", "check order"
 ]
 
-# Pre-compiled regex for storefront cart parsing
-# Matches: "2x iPhone 15 Pro - NGN 850,000"
-STOREFRONT_CART_RE = re.compile(r"(\d+)x\s+(.+?)\s+-\s+NGN[\s\d,\.]+", re.MULTILINE)
-
 
 def get_session(uid: str) -> dict:
     if uid not in sessions:
@@ -158,177 +161,15 @@ def get_session(uid: str) -> dict:
             "saved_address": "",
             "upsell_done":   False,
             "processing":    False,
-            "profile":       None,
+            "profile":       None,   # cached profile
         }
     return sessions[uid]
 
 
 # ══════════════════════════════════════════════════════
-# 3.  SQLITE SESSION STORE  [SQ-1]
-#
-#  Replaces the Google Sheets "Sessions" tab entirely.
-#  sqlite3 is built into Python — zero new dependencies.
-#  Thread-safe: each call opens its own connection with
-#  check_same_thread=False and WAL mode for concurrent reads.
-# ══════════════════════════════════════════════════════
-
-def _db_conn():
-    """Open a SQLite connection. WAL mode = safe concurrent reads/writes."""
-    conn = sqlite3.connect(SQLITE_DB, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_sqlite():
-    """
-    [SQ-1] Create the sessions table if it doesn't exist.
-    Called once at startup. Safe to call multiple times.
-    """
-    try:
-        with _db_conn() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS sessions (
-                    phone        TEXT PRIMARY KEY,
-                    stage        TEXT    DEFAULT 'browsing',
-                    name         TEXT    DEFAULT '',
-                    address      TEXT    DEFAULT '',
-                    cart         TEXT    DEFAULT '{}',
-                    last_updated INTEGER DEFAULT 0
-                )
-            """)
-            # Index for fast lookups by phone (already PK, but explicit)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_sessions_phone
-                ON sessions (phone)
-            """)
-            conn.commit()
-        print(f"[SQLite] Sessions DB ready: {SQLITE_DB}")
-    except Exception as e:
-        print(f"[SQLite] Init failed: {e}")
-
-
-def save_session_state(sc, phone: str, session: dict):
-    """
-    [SQ-1] Save checkout stage + cart to SQLite.
-    sc param kept for API compatibility but not used here.
-    Instant — no network call, no rate limits.
-    """
-    phone = clean_phone(phone)
-    try:
-        cart_json = json.dumps(session.get("cart", {}))
-        now_ts    = int(time.time())
-        with _db_conn() as conn:
-            conn.execute("""
-                INSERT INTO sessions (phone, stage, name, address, cart, last_updated)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(phone) DO UPDATE SET
-                    stage        = excluded.stage,
-                    name         = excluded.name,
-                    address      = excluded.address,
-                    cart         = excluded.cart,
-                    last_updated = excluded.last_updated
-            """, (
-                phone,
-                session.get("stage", "browsing"),
-                session.get("name", ""),
-                session.get("address", ""),
-                cart_json,
-                now_ts,
-            ))
-            conn.commit()
-    except Exception as e:
-        print(f"[SQLite] Save session failed: {e}")
-
-
-def load_session_state(sc, phone: str):
-    """
-    [SQ-1] Load saved checkout state from SQLite after a restart.
-    sc param kept for API compatibility but not used here.
-    Returns None if no session, session expired, or stage is browsing.
-    """
-    phone = clean_phone(phone)
-    try:
-        with _db_conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM sessions WHERE phone = ?", (phone,)
-            ).fetchone()
-
-        if not row:
-            return None
-
-        # Ignore stale sessions (older than SESSION_TIMEOUT seconds)
-        age = int(time.time()) - (row["last_updated"] or 0)
-        if age > SESSION_TIMEOUT:
-            return None
-
-        # Don't restore if already in browsing state — nothing to recover
-        if row["stage"] == "browsing":
-            return None
-
-        cart = {}
-        try:
-            cart = json.loads(row["cart"] or "{}")
-        except Exception:
-            pass
-
-        return {
-            "stage":   row["stage"],
-            "name":    row["name"],
-            "address": row["address"],
-            "cart":    cart,
-        }
-    except Exception as e:
-        print(f"[SQLite] Load session failed: {e}")
-        return None
-
-
-def clear_session_state(sc, phone: str):
-    """
-    [SQ-1] Reset session to browsing state after order completes.
-    sc param kept for API compatibility but not used here.
-    """
-    phone = clean_phone(phone)
-    try:
-        with _db_conn() as conn:
-            conn.execute("""
-                INSERT INTO sessions (phone, stage, name, address, cart, last_updated)
-                VALUES (?, 'browsing', '', '', '{}', ?)
-                ON CONFLICT(phone) DO UPDATE SET
-                    stage        = 'browsing',
-                    name         = '',
-                    address      = '',
-                    cart         = '{}',
-                    last_updated = excluded.last_updated
-            """, (phone, int(time.time())))
-            conn.commit()
-    except Exception as e:
-        print(f"[SQLite] Clear session failed: {e}")
-
-
-def cleanup_old_sessions():
-    """
-    [SQ-1] Delete sessions older than SESSION_TIMEOUT.
-    Called from /ping to keep the DB lean.
-    """
-    try:
-        cutoff = int(time.time()) - SESSION_TIMEOUT
-        with _db_conn() as conn:
-            deleted = conn.execute(
-                "DELETE FROM sessions WHERE last_updated < ?", (cutoff,)
-            ).rowcount
-            conn.commit()
-        if deleted:
-            print(f"[SQLite] Cleaned up {deleted} stale sessions")
-    except Exception as e:
-        print(f"[SQLite] Cleanup failed: {e}")
-
-
-# ══════════════════════════════════════════════════════
-# 4.  GOOGLE SHEETS  (Inventory, Customers, Sales only)
+# 3.  GOOGLE SHEETS
 # ══════════════════════════════════════════════════════
 def connect_sheets():
-    """Reset gc on error so it reconnects instead of staying broken."""
     global gc
     if gc is None:
         try:
@@ -340,16 +181,11 @@ def connect_sheets():
             gc    = gspread.authorize(creds)
         except Exception as e:
             print(f"[Sheets] Connection failed: {e}")
-            gc = None
     return gc
 
 
-def reset_sheets_connection():
-    global gc
-    gc = None
-
-
 def get_inventory(sc):
+    """FIX [5]: Reduced cache TTL to 2 mins so new products appear faster."""
     now = time.time()
     if inventory_cache["data"] is None or now - inventory_cache["last_updated"] > CACHE_TTL:
         try:
@@ -357,14 +193,14 @@ def get_inventory(sc):
             inventory_cache["last_updated"] = now
         except Exception as e:
             print(f"[Sheets] Inventory fetch failed: {e}")
-            reset_sheets_connection()
             return inventory_cache["data"] or []
     return inventory_cache["data"]
 
 
 def get_profile(sc, phone: str):
-    now    = time.time()
-    cached = profile_cache.get(phone)
+    """FIX [4]: Cache profile in memory, only hit Sheets every 5 mins."""
+    now     = time.time()
+    cached  = profile_cache.get(phone)
     if cached and now - cached["fetched_at"] < PROFILE_CACHE_TTL:
         return cached["data"]
     try:
@@ -374,16 +210,15 @@ def get_profile(sc, phone: str):
         return profile
     except Exception as e:
         print(f"[Sheets] Profile fetch failed: {e}")
-        reset_sheets_connection()
         return cached["data"] if cached else None
 
 
 def save_profile(sc, phone: str, name: str, address: str):
     try:
-        ws    = sc.open("TechSquad").worksheet("Customers")
-        rows  = ws.get_all_records()
+        ws   = sc.open("TechSquad").worksheet("Customers")
+        rows = ws.get_all_records()
         phone = clean_phone(phone)
-        idx   = next(
+        idx  = next(
             (i + 2 for i, r in enumerate(rows) if clean_phone(str(r.get("Phone", ""))) == phone),
             None
         )
@@ -392,10 +227,10 @@ def save_profile(sc, phone: str, name: str, address: str):
             ws.update(f"A{idx}:D{idx}", [row])
         else:
             ws.append_row(row)
+        # Bust profile cache
         profile_cache.pop(phone, None)
     except Exception as e:
         print(f"[Sheets] Save profile failed: {e}")
-        reset_sheets_connection()
 
 
 def log_order(sc, order_id, phone, name, items_text, address):
@@ -406,22 +241,107 @@ def log_order(sc, order_id, phone, name, items_text, address):
         ])
     except Exception as e:
         print(f"[Sheets] Log order failed: {e}")
-        reset_sheets_connection()
 
 
 def get_order_history(sc, phone: str):
     try:
-        rows  = sc.open("TechSquad").worksheet("Sales").get_all_records()
+        rows = sc.open("TechSquad").worksheet("Sales").get_all_records()
         phone = clean_phone(phone)
         return [r for r in rows if clean_phone(str(r.get("Phone", ""))) == phone]
     except Exception as e:
         print(f"[Sheets] Order history failed: {e}")
-        reset_sheets_connection()
         return []
 
 
+# FIX [3]: Session persistence — save/load checkout state to Sheets
+# so a Render restart doesn't wipe mid-checkout customers
+def save_session_state(sc, phone: str, session: dict):
+    """Save checkout stage + cart to Sheets so restarts don't lose it."""
+    try:
+        try:
+            ws = sc.open("TechSquad").worksheet("Sessions")
+        except Exception:
+            return  # Sessions tab not created yet — skip silently
+        rows = ws.get_all_records()
+        phone = clean_phone(phone)
+        idx  = next(
+            (i + 2 for i, r in enumerate(rows) if clean_phone(str(r.get("Phone", ""))) == phone),
+            None
+        )
+        cart_json = json.dumps(session.get("cart", {}))
+        row = [
+            phone,
+            session.get("stage", "browsing"),
+            session.get("name", ""),
+            session.get("address", ""),
+            cart_json,
+            time.strftime("%Y-%m-%d %H:%M"),
+        ]
+        if idx:
+            ws.update(f"A{idx}:F{idx}", [row])
+        else:
+            ws.append_row(row)
+    except Exception as e:
+        print(f"[Sessions] Save failed: {e}")
+
+
+def load_session_state(sc, phone: str) -> dict | None:
+    """Load saved checkout state from Sheets after a restart."""
+    try:
+        try:
+            ws = sc.open("TechSquad").worksheet("Sessions")
+        except Exception:
+            return None  # Sessions tab not created yet — skip silently
+        rows = ws.get_all_records()
+        phone = clean_phone(phone)
+        row  = next((r for r in rows if clean_phone(str(r.get("Phone", ""))) == phone), None)
+        if not row:
+            return None
+        # Only restore if it was updated in the last 30 mins
+        last = row.get("LastUpdated", "")
+        if last:
+            try:
+                saved_ts = time.mktime(time.strptime(last, "%Y-%m-%d %H:%M"))
+                if time.time() - saved_ts > 1800:  # 30 min timeout
+                    return None
+            except Exception:
+                pass
+        cart = {}
+        try:
+            cart = json.loads(row.get("Cart", "{}"))
+        except Exception:
+            pass
+        return {
+            "stage":   row.get("Stage", "browsing"),
+            "name":    row.get("Name", ""),
+            "address": row.get("Address", ""),
+            "cart":    cart,
+        }
+    except Exception as e:
+        print(f"[Sessions] Load failed: {e}")
+        return None
+
+
+def clear_session_state(sc, phone: str):
+    """Clear saved session after order is complete."""
+    try:
+        try:
+            ws = sc.open("TechSquad").worksheet("Sessions")
+        except Exception:
+            return  # Sessions tab not created yet — skip silently
+        rows = ws.get_all_records()
+        idx  = next(
+            (i + 2 for i, r in enumerate(rows) if str(r.get("Phone", "")) == str(phone)),
+            None
+        )
+        if idx:
+            ws.update(f"A{idx}:F{idx}", [[phone, "browsing", "", "", "{}", time.strftime("%Y-%m-%d %H:%M")]])
+    except Exception as e:
+        print(f"[Sessions] Clear failed: {e}")
+
+
 # ══════════════════════════════════════════════════════
-# 5.  CART HELPERS
+# 4.  CART HELPERS
 # ══════════════════════════════════════════════════════
 def price_map(inventory: list) -> dict:
     return {p.get("Product"): int(p.get("Price", 0)) for p in inventory}
@@ -475,18 +395,30 @@ def find_upsell(cart: dict, inventory: list):
 
 
 # ══════════════════════════════════════════════════════
-# 6.  AI ENGINE
+# 5.  AI ENGINE
+#     FIX [9]: Auto-switch Groq → Gemini → Claude
+#     based on AI_ENGINE env var
+#     FIX [10]: Token usage logger
 # ══════════════════════════════════════════════════════
 def log_tokens(count: int):
+    """FIX [10]: Track daily token usage so you know your costs."""
     today = time.strftime("%Y-%m-%d")
     token_log[today] = token_log.get(today, 0) + count
-    if token_log[today] % 10000 < count:
+    if token_log[today] % 10000 < count:  # log every ~10k tokens
         print(f"[Tokens] {today}: {token_log[today]:,} tokens used today")
 
 
 def ask_ai(system_prompt: str, history: list) -> str:
+    """
+    FIX [9]: Single function, switches AI based on AI_ENGINE env var.
+    Switch anytime with zero code changes:
+      AI_ENGINE=groq    → free, fast, good enough
+      AI_ENGINE=gemini  → cheap, smart, ₦2,300/month at scale
+      AI_ENGINE=claude  → premium, best, for high-value clients
+    """
     engine = AI_ENGINE
 
+    # ── GROQ (free) ──────────────────────────────────
     if engine == "groq":
         if not GROQ_API_KEY:
             return "GROQ_API_KEY not set."
@@ -500,7 +432,7 @@ def ask_ai(system_prompt: str, history: list) -> str:
                 json={
                     "model": GROQ_MODEL,
                     "messages": [{"role": "system", "content": system_prompt}] + history,
-                    "max_tokens": 350,
+                    "max_tokens": 350,      # FIX: was 600, cut output cost
                     "temperature": 0.6,
                 },
                 timeout=30,
@@ -514,14 +446,17 @@ def ask_ai(system_prompt: str, history: list) -> str:
             print(f"[Groq] {e}")
             return "One moment, please try again."
 
+    # ── GEMINI FLASH (cheapest paid) ─────────────────
     if engine == "gemini":
         if not GEMINI_API_KEY:
             return "GEMINI_API_KEY not set."
         try:
+            # Convert history to Gemini format
             contents = []
             for msg in history:
                 role = "user" if msg["role"] == "user" else "model"
                 contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+
             resp = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
                 f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
@@ -534,12 +469,14 @@ def ask_ai(system_prompt: str, history: list) -> str:
             )
             data  = resp.json()
             reply = data["candidates"][0]["content"]["parts"][0]["text"]
+            # Gemini doesn't return token count in basic response — estimate
             log_tokens(len(system_prompt.split()) + len(reply.split()))
             return reply
         except Exception as e:
             print(f"[Gemini] {e}")
             return "One moment, please try again."
 
+    # ── CLAUDE SONNET (premium) ───────────────────────
     if engine == "claude":
         if not ANTHROPIC_API_KEY:
             return "ANTHROPIC_API_KEY not set."
@@ -553,7 +490,7 @@ def ask_ai(system_prompt: str, history: list) -> str:
                 },
                 json={
                     "model": "claude-sonnet-4-20250514",
-                    "max_tokens": 350,
+                    "max_tokens": 350,      # FIX: cut output tokens
                     "system": system_prompt,
                     "messages": history,
                 },
@@ -573,9 +510,14 @@ def ask_ai(system_prompt: str, history: list) -> str:
 
 
 # ══════════════════════════════════════════════════════
-# 7.  SYSTEM PROMPT
+# 6.  SYSTEM PROMPT  (FIX [1]: cut from ~800 to ~280 tokens)
 # ══════════════════════════════════════════════════════
 def build_prompt(inventory, profile, cart) -> str:
+    """
+    FIX [1]: Drastically shortened prompt.
+    Removed redundant explanations, examples, and repetition.
+    Same behaviour, 65% fewer input tokens.
+    """
     available = []
     for p in inventory:
         try:
@@ -618,7 +560,7 @@ RULES:
 
 
 # ══════════════════════════════════════════════════════
-# 8.  CHECKOUT STATE MACHINE
+# 7.  CHECKOUT STATE MACHINE
 # ══════════════════════════════════════════════════════
 def handle_checkout_state(uid: str, text: str, session: dict, sc):
     stage = session.get("stage", "browsing")
@@ -626,7 +568,7 @@ def handle_checkout_state(uid: str, text: str, session: dict, sc):
     if stage == "awaiting_name":
         session["name"]  = text.strip().title()
         session["stage"] = "awaiting_address"
-        save_session_state(sc, uid, session)
+        save_session_state(sc, uid, session)   # FIX [3]
         return (
             f"Nice to meet you, {session['name']}! 😊\n"
             f"What's your delivery address? (street, area, city)"
@@ -634,7 +576,7 @@ def handle_checkout_state(uid: str, text: str, session: dict, sc):
 
     if stage == "awaiting_address":
         session["address"] = text.strip()
-        save_session_state(sc, uid, session)
+        save_session_state(sc, uid, session)   # FIX [3]
         return _generate_receipt(uid, session, sc)
 
     if stage == "awaiting_address_confirm":
@@ -649,12 +591,12 @@ def handle_checkout_state(uid: str, text: str, session: dict, sc):
 
 
 def _generate_receipt(uid: str, session: dict, sc) -> str:
-    inventory = get_inventory(sc)
-    order_id  = f"TS-{uuid.uuid4().hex[:6].upper()}"
-    name      = session["name"]
-    address   = session["address"]
-    cart      = session.get("cart", {})
-    pm        = price_map(inventory)
+    inventory  = get_inventory(sc)
+    order_id   = f"TS-{uuid.uuid4().hex[:6].upper()}"
+    name       = session["name"]
+    address    = session["address"]
+    cart       = session.get("cart", {})
+    pm         = price_map(inventory)
 
     lines = []
     total = 0
@@ -678,11 +620,13 @@ def _generate_receipt(uid: str, session: dict, sc) -> str:
         f"Save your Order ID: *{order_id}*"
     )
 
+    # Log to Sheets
     log_order(sc, order_id, uid, name, cart_log_text(cart, inventory), address)
     save_profile(sc, uid, name, address)
-    clear_session_state(sc, uid)
+    clear_session_state(sc, uid)    # FIX [3]: clean up saved state
     print(f"[ORDER] {order_id} → {uid}")
 
+    # Reset session
     session.update({
         "cart": {}, "stage": "browsing", "history": [],
         "name": "", "address": "", "upsell_done": False,
@@ -691,11 +635,12 @@ def _generate_receipt(uid: str, session: dict, sc) -> str:
 
 
 # ══════════════════════════════════════════════════════
-# 9.  MAIN CONVERSATION PROCESSOR
+# 8.  MAIN CONVERSATION PROCESSOR
 # ══════════════════════════════════════════════════════
 def process_conversation(uid: str, text: str):
     session = get_session(uid)
 
+    # FIX [11]: Queue lock — wait up to 5s if processing
     waited = 0
     while session.get("processing") and waited < 5:
         time.sleep(1)
@@ -705,18 +650,15 @@ def process_conversation(uid: str, text: str):
     try:
         sc = connect_sheets()
         if not sc:
-            green_api.sending.sendMessage(send_phone(uid), "Database syncing. Try again shortly.")
+            time.sleep(random.uniform(1.5, 3.5))
+            send_whatsapp(uid, "Database syncing. Try again shortly.")
             return
 
         inventory  = get_inventory(sc)
         text_lower = text.lower().strip()
 
-        # ── STEP 1: Restore session from SQLite if server restarted ──
-        # Only restore if stage is browsing, cart is empty, and no
-        # history yet in this session (fresh RAM session after restart)
-        if (session.get("stage") == "browsing"
-                and not session.get("cart")
-                and not session.get("history")):
+        # ── STEP 1: Restore session from Sheets if Render restarted ──
+        if session.get("stage") == "browsing" and not session.get("cart"):
             saved = load_session_state(sc, uid)
             if saved and saved.get("stage") != "browsing":
                 session.update(saved)
@@ -725,19 +667,20 @@ def process_conversation(uid: str, text: str):
         # ── STEP 2: Checkout state machine (name/address steps) ──
         state_reply = handle_checkout_state(uid, text, session, sc)
         if state_reply:
-            green_api.sending.sendMessage(send_phone(uid), state_reply)
+            time.sleep(random.uniform(1.5, 3.5))
+            send_whatsapp(uid, state_reply)
             return
 
-        # ── STEP 3: Parse cart items ──────────────────────────────
-        # MUST run before checkout trigger check (BF-1).
-        # Storefront message has items AND "please confirm my order".
+        # ── STEP 3: Parse cart items BEFORE checkout logic ──
+        import re as _re
         added_items = []
 
-        sf_matches = STOREFRONT_CART_RE.findall(text)
+        # Parse storefront format: "2x Product Name - NGN 10,000"
+        sf_matches = _re.findall(r"(\d+)x\s+(.+?)\s+-\s+NGN", text)
         if sf_matches:
             for qty_str, item_name in sf_matches:
                 item_name = item_name.strip()
-                qty       = int(qty_str)
+                qty = int(qty_str)
                 for p in inventory:
                     pname = p.get("Product", "")
                     try:
@@ -745,14 +688,15 @@ def process_conversation(uid: str, text: str):
                     except Exception:
                         stock = 0
                     if stock > 0 and (
-                        pname.lower() == item_name.lower()
-                        or pname.lower() in item_name.lower()
-                        or item_name.lower() in pname.lower()
+                        pname.lower() == item_name.lower() or
+                        pname.lower() in item_name.lower() or
+                        item_name.lower() in pname.lower()
                     ):
                         session["cart"][pname] = session["cart"].get(pname, 0) + qty
                         added_items.append((pname, qty))
                         break
         else:
+            # Natural text: customer types product name
             for p in inventory:
                 pname = p.get("Product", "")
                 try:
@@ -760,7 +704,7 @@ def process_conversation(uid: str, text: str):
                 except Exception:
                     stock = 0
                 if stock > 0 and pname.lower() in text_lower:
-                    qty   = 1
+                    qty = 1
                     words = text_lower.replace("x", " ").split()
                     for word in words:
                         if word.isdigit():
@@ -772,52 +716,55 @@ def process_conversation(uid: str, text: str):
         if added_items:
             save_session_state(sc, uid, session)
 
-        # ── STEP 4: Checkout trigger ──────────────────────────────
+        # ── STEP 4: Checkout trigger ──
         is_order_msg = (
-            "i would like to order" in text_lower
-            or "please confirm my order" in text_lower
+            "i would like to order" in text_lower or
+            "please confirm my order" in text_lower
         )
         if any(t in text_lower for t in CHECKOUT_TRIGGERS) or is_order_msg:
             cart = session.get("cart", {})
             if not cart:
                 msg = "Your cart is empty! Browse here: " + CATALOG_URL
-                green_api.sending.sendMessage(send_phone(uid), msg)
+                time.sleep(random.uniform(1.5, 3.5))
+                send_whatsapp(uid, msg)
                 return
             profile = get_profile(sc, uid)
             if profile:
                 session["stage"]         = "awaiting_address_confirm"
                 session["name"]          = profile.get("Name", "")
                 session["saved_address"] = profile.get("Address", "")
-                saved_addr               = profile.get("Address", "")
-                reply  = "Here's your cart:\n" + cart_display(cart, inventory)
+                saved_addr = profile.get("Address", "")
+                reply = "Here's your cart:\n" + cart_display(cart, inventory)
                 reply += "\n\nDeliver to saved address?\n" + saved_addr
                 reply += "\n\nReply YES to confirm or send a new address."
             else:
                 session["stage"] = "awaiting_name"
-                reply  = "Here's your cart:\n" + cart_display(cart, inventory)
+                reply = "Here's your cart:\n" + cart_display(cart, inventory)
                 reply += "\n\nWhat's your full name for delivery?"
             save_session_state(sc, uid, session)
-            green_api.sending.sendMessage(send_phone(uid), reply)
+            time.sleep(random.uniform(1.5, 3.5))
+            send_whatsapp(uid, reply)
             return
 
-        # ── STEP 5: Order tracking ────────────────────────────────
+        # ── STEP 5: Order tracking ──
         if any(t in text_lower for t in TRACK_TRIGGERS):
             order_hist = get_order_history(sc, uid)
             if order_hist:
-                last  = order_hist[-1]
+                last = order_hist[-1]
                 reply = (
                     "Latest order\n\n"
-                    "ID: "     + str(last.get("OrderID", "")) + "\n"
-                    "Items: "  + str(last.get("Items", ""))   + "\n"
-                    "Status: " + str(last.get("Status", ""))  + "\n"
-                    "Date: "   + str(last.get("Date", ""))
+                    "ID: " + str(last.get("OrderID", "")) + "\n"
+                    "Items: " + str(last.get("Items", "")) + "\n"
+                    "Status: " + str(last.get("Status", "")) + "\n"
+                    "Date: " + str(last.get("Date", ""))
                 )
             else:
                 reply = "No orders found for your number yet."
-            green_api.sending.sendMessage(send_phone(uid), reply)
+            time.sleep(random.uniform(1.5, 3.5))
+            send_whatsapp(uid, reply)
             return
 
-        # ── STEP 6: AI reply ──────────────────────────────────────
+        # ── STEP 6: AI reply ──
         if session.get("profile") is None:
             session["profile"] = get_profile(sc, uid)
         profile = session["profile"]
@@ -829,26 +776,26 @@ def process_conversation(uid: str, text: str):
         reply = ask_ai(system_prompt, session["history"])
         session["history"].append({"role": "assistant", "content": reply})
 
-        # ── STEP 7: Upsell once per order ─────────────────────────
-        # Build full reply first, then send once (BF-2)
+        # ── STEP 7: Upsell once per order ──
         if added_items and not session.get("upsell_done"):
             suggestion = find_upsell(session["cart"], inventory)
             if suggestion:
-                pm_    = price_map(inventory)
+                pm_ = price_map(inventory)
                 uprice = pm_.get(suggestion, 0)
-                reply += (
-                    f"\n\nCustomers who get {added_items[0][0]} usually grab "
-                    f"{suggestion} too (NGN {uprice:,}). Add it?"
-                )
+                reply += "\n\nCustomers who get " + added_items[0][0]
+                reply += " usually grab " + suggestion + " too (NGN " + f"{uprice:,}" + "). Add it?"
                 session["upsell_done"] = True
 
-        green_api.sending.sendMessage(send_phone(uid), reply)
+        time.sleep(random.uniform(1.5, 3.5))
+        send_whatsapp(uid, reply)
+
 
     except Exception as e:
         print(f"[Error] {uid}: {e}")
         traceback.print_exc()
         try:
-            green_api.sending.sendMessage(send_phone(uid), "Something went wrong. Please try again.")
+            time.sleep(random.uniform(1.5, 3.5))
+            send_whatsapp(uid, "Something went wrong. Please try again.")
         except Exception:
             pass
     finally:
@@ -856,53 +803,68 @@ def process_conversation(uid: str, text: str):
 
 
 # ══════════════════════════════════════════════════════
-# 10. WEBHOOK
+# 9.  WEBHOOK
 # ══════════════════════════════════════════════════════
+@app.route("/webhook", methods=["GET"])
+def webhook_verify():
+    """Meta API webhook verification."""
+    mode      = request.args.get("hub.mode")
+    token     = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+    if mode == "subscribe" and token == ADMIN_SECRET:
+        print("[Webhook] Verified by Meta")
+        return challenge, 200
+    return "Forbidden", 403
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
-    if not data or data.get("typeWebhook") != "incomingMessageReceived":
+    if not data:
         return "OK", 200
     try:
-        msg_data = data.get("messageData", {})
-        uid      = clean_phone(data.get("senderData", {}).get("sender", ""))
-        msg_type = msg_data.get("typeMessage")
+        for entry in data.get("entry", []):
+            for change in entry.get("changes", []):
+                value    = change.get("value", {})
+                messages = value.get("messages", [])
+                for msg in messages:
+                    uid      = clean_phone(msg.get("from", ""))
+                    msg_type = msg.get("type", "")
 
-        if not uid:
-            return "OK", 200
+                    if not uid:
+                        continue
 
-        if msg_type in MEDIA_TYPES:
-            media_reply = (
-                "Hey! 👋 I cannot view images or screenshots, but no worries! "
-                "Browse our full catalog here and tap any item to order: "
-                + CATALOG_URL
-                + " Or just type what you are looking for and I will help! 😊"
-            )
-            green_api.sending.sendMessage(send_phone(uid), media_reply)
-            return "OK", 200
+                    if msg_type in ("image","video","audio","document","sticker"):
+                        media_reply = (
+                            "Hey! 👋 I cannot view images or screenshots, but no worries! "
+                            "Browse our full catalog here and tap any item to order: "
+                            + CATALOG_URL
+                            + " Or just type what you are looking for and I will help! 😊"
+                        )
+                        time.sleep(random.uniform(1.5, 3.5))
+                        send_whatsapp(uid, media_reply)
+                        continue
 
-        text = (
-            msg_data.get("textMessageData", {}).get("textMessage")
-            or msg_data.get("extendedTextMessageData", {}).get("text")
-            or msg_data.get("extendedTextMessageData", {}).get("description")
-            or ""
-        ).strip()
-
-        if not text:
-            return "OK", 200
-
-        t = threading.Thread(target=process_conversation, args=(uid, text))
-        t.daemon = True
-        t.start()
+                    if msg_type == "text":
+                        text = msg.get("text", {}).get("body", "").strip()
+                        if not text:
+                            continue
+                        print(f"[Webhook] {uid}: {text[:50]}")
+                        t = threading.Thread(
+                            target=process_conversation, args=(uid, text)
+                        )
+                        t.daemon = True
+                        t.start()
 
     except Exception as e:
         print(f"[Webhook] {e}")
+        traceback.print_exc()
 
     return "OK", 200
 
 
 # ══════════════════════════════════════════════════════
-# 11. STOREFRONT
+# 10. STOREFRONT  — working cart, mobile + PC optimised
 # ══════════════════════════════════════════════════════
 @app.route("/shop/<vendor_name>")
 def shop(vendor_name):
@@ -979,14 +941,18 @@ body{font-family:'Sora',sans-serif;background:var(--bg);color:var(--text);min-he
 .btn-soldout{background:#1a1a1a;color:var(--muted);border:1px solid var(--border);font-size:12px;font-weight:600;padding:9px 14px;border-radius:8px;cursor:not-allowed}
 .ftr{text-align:center;padding:20px;color:var(--muted);font-size:11px;border-top:1px solid var(--border);margin-top:10px}
 .ftr a{color:var(--green);text-decoration:none}
+/* TOAST */
 #toast{position:fixed;top:74px;left:50%;transform:translateX(-50%) translateY(-8px);background:#0d2211;border:1px solid var(--green);color:var(--green);font-size:13px;font-weight:600;padding:9px 18px;border-radius:30px;opacity:0;pointer-events:none;z-index:9999;transition:all .25s;white-space:nowrap}
 #toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+/* CART BUTTON */
 #cartBtn{position:fixed;bottom:0;left:0;right:0;background:var(--green);color:#000;border:none;font-family:'Sora',sans-serif;font-weight:700;font-size:15px;padding:16px 20px;cursor:pointer;z-index:500;display:none;align-items:center;justify-content:center;gap:10px;transition:opacity .15s}
 #cartBtn:hover{opacity:.9}
 #cartBtn.on{display:flex}
 .cbadge{background:#000;color:var(--green);font-size:12px;font-weight:700;padding:2px 10px;border-radius:20px}
+/* OVERLAY */
 #ov{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:600;opacity:0;pointer-events:none;transition:opacity .25s}
 #ov.on{opacity:1;pointer-events:all}
+/* PANEL */
 #panel{position:fixed;bottom:0;left:0;right:0;background:#0d1a10;border-top:2px solid var(--green);border-radius:20px 20px 0 0;z-index:700;max-height:85vh;display:flex;flex-direction:column;transform:translateY(100%);transition:transform .3s cubic-bezier(.4,0,.2,1)}
 #panel.on{transform:translateY(0)}
 @media(min-width:768px){
@@ -1028,7 +994,7 @@ var tt;
 function addItem(id){
   cart[id]=(cart[id]||0)+1;
   draw();
-  show_toast(P[id].name+' added! Tap cart to view 🛒');
+  show_toast(P[id].name+' added! Tap cart to view Ὥ2');
   var c=document.getElementById('c'+id);
   if(c)c.classList.add('inc');
   var b=c?c.querySelector('.btn-add'):null;
@@ -1105,10 +1071,10 @@ function send_order(){
             "<link href='https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&display=swap' rel='stylesheet'>"
             f"<style>{CSS}</style>"
             "</head><body>"
-            f"<header class='hdr'><h1>{vendor_title}</h1><p>Powered by CodedLabs</p></header>"
+            f"<header class='hdr'><h1>{vendor_title}</h1><p>Powered by The Tech Squad</p></header>"
             "<div id='toast'></div>"
             f"<div class='grid'>{cards}</div>"
-            f"<footer class='ftr'>Powered by CodedLabs &middot; <a href='https://wa.me/{BOT_PHONE}'>Chat with Jordan</a></footer>"
+            f"<footer class='ftr'>The Tech Squad &middot; <a href='https://wa.me/{BOT_PHONE}'>Chat with Jordan</a></footer>"
             "<button id='cartBtn' onclick='open_panel()'>"
             "&#x1F6D2; View Cart <span class='cbadge' id='cnt'>0 items</span>"
             "</button>"
@@ -1135,7 +1101,7 @@ function send_order(){
 
 
 # ══════════════════════════════════════════════════════
-# 12. BROADCAST
+# 11. BROADCAST  (FIX [6]: rate limited + max 100/hour)
 # ══════════════════════════════════════════════════════
 @app.route("/broadcast", methods=["POST"])
 def broadcast():
@@ -1154,6 +1120,7 @@ def broadcast():
     hourly_count = 0
 
     for c in customers:
+        # FIX [6]: Cap at 100 per hour to avoid WhatsApp spam flag
         if hourly_count >= BROADCAST_HOURLY:
             print(f"[Broadcast] Hourly limit reached. {sent} sent, stopping.")
             break
@@ -1161,10 +1128,10 @@ def broadcast():
         if not phone:
             continue
         try:
-            green_api.sending.sendMessage(send_phone(phone), msg)
-            sent         += 1
+            send_whatsapp(phone, msg)
+            sent        += 1
             hourly_count += 1
-            time.sleep(BROADCAST_DELAY)
+            time.sleep(BROADCAST_DELAY)   # FIX [6]: 3s gap (was 1.2s)
         except Exception as e:
             print(f"[Broadcast] {phone}: {e}")
             failed += 1
@@ -1173,7 +1140,7 @@ def broadcast():
 
 
 # ══════════════════════════════════════════════════════
-# 13. ADMIN DASHBOARD
+# 12. ADMIN DASHBOARD
 # ══════════════════════════════════════════════════════
 @app.route("/admin")
 def admin():
@@ -1195,16 +1162,6 @@ def admin():
     today           = time.strftime("%Y-%m-%d")
     tokens_today    = token_log.get(today, 0)
     ai_label        = {"groq":"CodedLabs AI","gemini":"CodedLabs AI","claude":"CodedLabs AI"}.get(AI_ENGINE, AI_ENGINE)
-
-    # Active sessions count from SQLite
-    try:
-        with _db_conn() as conn:
-            active_sessions = conn.execute(
-                "SELECT COUNT(*) FROM sessions WHERE stage != 'browsing' AND last_updated > ?",
-                (int(time.time()) - SESSION_TIMEOUT,)
-            ).fetchone()[0]
-    except Exception:
-        active_sessions = len(sessions)
 
     sales_rows = ""
     for s in reversed(sales[-100:]):
@@ -1280,7 +1237,6 @@ textarea:focus{{border-color:var(--g)}}
     <div class="stat"><div class="stat-n" style="color:#22c55e">{delivered}</div><div class="stat-l">Delivered</div></div>
     <div class="stat"><div class="stat-n" style="color:#3b82f6">{total_customers}</div><div class="stat-l">Customers</div></div>
     <div class="stat"><div class="stat-n" style="color:#a78bfa">{tokens_today:,}</div><div class="stat-l">Tokens Today</div></div>
-    <div class="stat"><div class="stat-n" style="color:#fb923c">{active_sessions}</div><div class="stat-l">Active Checkouts</div></div>
   </div>
   {low_banner}
   <div class="card">
@@ -1324,8 +1280,10 @@ async function send(){{
 
 
 # ══════════════════════════════════════════════════════
-# 14. UTILITY ENDPOINTS
+# 13. UTILITY ENDPOINTS
 # ══════════════════════════════════════════════════════
+
+# FIX [7]: Manual cache refresh
 @app.route("/refresh")
 def refresh():
     if request.args.get("secret") != ADMIN_SECRET:
@@ -1336,14 +1294,13 @@ def refresh():
     return "Cache cleared. Next request will fetch fresh data.", 200
 
 
+# FIX [8]: Keep-alive ping for cron-job.org
 @app.route("/ping")
 def ping():
-    # Piggyback SQLite cleanup on the keep-alive ping
-    # Runs every 10 mins via cron-job.org — keeps DB lean automatically
-    cleanup_old_sessions()
     return "pong", 200
 
 
+# Health check
 @app.route("/")
 def health():
     today  = time.strftime("%Y-%m-%d")
@@ -1355,12 +1312,6 @@ def health():
         f"Active sessions: {len(sessions)}"
     ), 200
 
-
-# ══════════════════════════════════════════════════════
-# 15. STARTUP
-# ══════════════════════════════════════════════════════
-# Initialise SQLite on startup — creates sessions.db if it doesn't exist
-init_sqlite()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
